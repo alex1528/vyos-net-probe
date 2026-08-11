@@ -1,0 +1,56 @@
+#!/bin/sh
+# =============================================================================
+# pre-commit: 提交前自动安全检查 + 语法校验，任一失败则中止提交
+#
+# 激活方式（克隆后执行一次）:
+#   git config core.hooksPath .githooks
+#
+# 跳过检查（单次，谨慎使用）:
+#   git commit --no-verify -m "..."
+# =============================================================================
+set -eu
+
+FAIL=0
+
+# ---- 1. 密钥/密码明文检查（仅扫描暂存区新增/修改，--diff-filter=ACMR 避免误报删除）----
+# 命中真实赋值（排除 CHANGE_ME/placeholder/example 等占位符）
+if git diff --cached --diff-filter=ACMR -U0 2>/dev/null \
+   | grep -nE '^\+' \
+   | grep -iE '(password|passwd|secret|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+/]{8,}' \
+   | grep -viE '(CHANGE_ME|placeholder|example|xxx+|your[_-]?|<.*>)'; then
+    echo "[pre-commit] ✘ 暂存内容疑似含明文密钥/密码，已中止提交。请脱敏后重试。"
+    FAIL=1
+fi
+
+# ---- 2. 私钥文件特征检查 ----
+if git diff --cached --diff-filter=ACMR 2>/dev/null \
+   | grep -qE 'BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY'; then
+    echo "[pre-commit] ✘ 暂存内容含私钥（PRIVATE KEY），已中止提交。"
+    FAIL=1
+fi
+
+# ---- 3. Python 语法校验（仅校验暂存区的 .py 文件）----
+if command -v python3 >/dev/null 2>&1; then
+    for f in $(git diff --cached --diff-filter=ACMR --name-only | grep -E '\.py$' || true); do
+        [ -f "$f" ] || continue
+        if ! python3 -m py_compile "$f" 2>/dev/null; then
+            echo "[pre-commit] ✘ Python 语法错误：$f"
+            FAIL=1
+        fi
+    done
+fi
+
+# ---- 4. 禁止提交运行时产物（双保险，即使 .gitignore 失效）----
+if git diff --cached --diff-filter=ACMR --name-only 2>/dev/null \
+   | grep -qE '\.(jsonl|log|pyc)$'; then
+    echo "[pre-commit] ✘ 暂存区含运行时产物（*.jsonl/*.log/*.pyc），请勿提交。"
+    FAIL=1
+fi
+
+if [ "$FAIL" -ne 0 ]; then
+    echo "[pre-commit] 检查未通过，提交已中止。如确需跳过：git commit --no-verify"
+    exit 1
+fi
+
+echo "[pre-commit] ✔ 安全检查与语法校验通过"
+exit 0

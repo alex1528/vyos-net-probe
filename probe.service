@@ -1,0 +1,22 @@
+[Unit]
+Description=出口分流探针服务 (probe_server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 探针服务安装目录（部署脚本会同步到此路径）
+WorkingDirectory=/opt/vyos-net-probe
+ExecStart=/usr/bin/python3 /opt/vyos-net-probe/probe_server.py
+Environment=PROBE_HOST=127.0.0.1
+Environment=PROBE_PORT=8899
+Environment=PROBE_DNS=127.0.0.1
+Restart=on-failure
+RestartSec=3
+# 安全加固（探针只需读+网络，无需写系统）
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/vyos-net-probe
+
+[Install]
+WantedBy=multi-user.target

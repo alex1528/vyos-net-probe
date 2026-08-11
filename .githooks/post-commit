@@ -1,0 +1,76 @@
+#!/bin/sh
+# =============================================================================
+# post-commit: 每次提交后自动创建递增语义化版本 tag
+#
+# 激活方式（克隆后执行一次）:
+#   git config core.hooksPath .githooks
+#
+# 跳过自动 tag（单次）:
+#   SKIP_AUTO_TAG=1 git commit -m "..."
+# =============================================================================
+set -eu
+
+# 防止递归调用（git tag 本身不会触发 post-commit，此处作为额外保险）
+if [ "${SKIP_AUTO_TAG:-0}" = "1" ]; then
+    exit 0
+fi
+
+# 确保在 git 仓库内运行
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    exit 0
+fi
+
+# 若当前 commit 已有版本 tag，跳过（幂等保护）
+if git tag --points-at HEAD 2>/dev/null | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+    exit 0
+fi
+
+# 取最新语义化版本 tag
+last_tag="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sed 's/^v//' \
+    | sort -t. -k1,1n -k2,2n -k3,3n \
+    | tail -1 \
+    | head -1)"
+
+if [ -n "$last_tag" ]; then
+	base_version="$last_tag"
+else
+	base_version="0.0.0"
+fi
+
+# 解析 major.minor.patch（严格十进制整数）
+IFS='.' read -r major minor patch <<EOF
+$base_version
+EOF
+
+# 确保变量为有效十进制整数，否则归零
+case "$major" in ''|*[!0-9]*) major=0 ;; esac
+case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
+case "$patch" in ''|*[!0-9]*) patch=0 ;; esac
+
+# patch 递增（每满 10 进 1）
+patch=$((patch + 1))
+if [ "$patch" -ge 10 ]; then
+    patch=0
+    minor=$((minor + 1))
+fi
+if [ "$minor" -ge 10 ]; then
+    minor=0
+    major=$((major + 1))
+fi
+
+next_tag="v${major}.${minor}.${patch}"
+
+# dry-run 模式：仅打印下一个 tag，不实际创建
+if [ "${1:-}" = "--dry-run" ]; then
+    printf '%s\n' "$next_tag"
+    exit 0
+fi
+
+# 创建带注释 tag
+if SKIP_AUTO_TAG=1 git tag -a "$next_tag" -m "Auto tag $next_tag" 2>/dev/null; then
+    printf '[post-commit] auto tag: %s\n' "$next_tag"
+else
+    printf '[post-commit] tag %s already exists, skipped\n' "$next_tag"
+fi

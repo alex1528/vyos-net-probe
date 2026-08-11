@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>出口分流监控看板</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#30363d;
+    --txt:#e6edf3; --dim:#8b949e; --green:#3fb950; --red:#f85149;
+    --yellow:#d29922; --blue:#58a6ff; --cyan:#39c5cf; --accent:#1f6feb; --purple:#bc8cff;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    padding:24px;min-height:100vh}
+  .wrap{max-width:1080px;margin:0 auto}
+  header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px}
+  h1{font-size:20px;font-weight:600;display:flex;align-items:center;gap:10px}
+  .logo{width:30px;height:30px;border-radius:7px;background:linear-gradient(135deg,var(--cyan),var(--accent));
+    display:flex;align-items:center;justify-content:center;font-size:16px}
+  .meta{font-size:12px;color:var(--dim);text-align:right;line-height:1.6}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
+  button{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:8px 16px;
+    font-size:13px;cursor:pointer;font-weight:500;display:flex;align-items:center;gap:6px;transition:.15s}
+  button:hover{filter:brightness(1.12)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .btn-ghost{background:var(--panel2);border:1px solid var(--border);color:var(--txt)}
+  .auto{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:6px}
+  .auto input{accent-color:var(--accent)}
+
+  .banner{border-radius:10px;padding:16px 20px;margin-bottom:18px;font-size:15px;font-weight:600;
+    display:flex;align-items:center;gap:12px;border:1px solid var(--border)}
+  .banner.ok{background:rgba(63,185,80,.12);border-color:rgba(63,185,80,.4);color:var(--green)}
+  .banner.bad{background:rgba(248,81,73,.12);border-color:rgba(248,81,73,.4);color:var(--red)}
+  .banner.wait{background:var(--panel);color:var(--dim)}
+  .banner .big{font-size:22px}
+
+  .sec-title{font-size:13px;color:var(--dim);margin:20px 0 10px;display:flex;align-items:center;gap:8px;
+    text-transform:uppercase;letter-spacing:.5px}
+  .sec-title::after{content:"";flex:1;height:1px;background:var(--border)}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;
+    position:relative;overflow:hidden}
+  .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px}
+  .card.oversea::before{background:var(--cyan)}
+  .card.domestic::before{background:var(--yellow)}
+  .card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  .domain{font-size:15px;font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .tag{font-size:11px;padding:3px 9px;border-radius:20px;font-weight:600}
+  .tag.oversea{background:rgba(57,197,207,.15);color:var(--cyan)}
+  .tag.domestic{background:rgba(210,153,34,.15);color:var(--yellow)}
+  .row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;
+    border-bottom:1px dashed var(--border);font-size:13px}
+  .row:last-of-type{border-bottom:none}
+  .row .k{color:var(--dim);display:flex;align-items:center;gap:7px}
+  .row .v{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
+  .lv{font-size:10px;padding:1px 6px;border-radius:4px;font-weight:700}
+  .lv.ok{background:rgba(63,185,80,.15);color:var(--green)}
+  .lv.no{background:rgba(248,81,73,.15);color:var(--red)}
+  .v.ip{color:var(--yellow)} .v.dns{color:var(--green)} .v.fail{color:var(--red)}
+  .v.dimv{color:var(--dim);font-weight:400} .v.lat{color:var(--purple)}
+  .verdict{margin-top:10px;padding:7px 12px;border-radius:7px;font-size:12px;font-weight:600;text-align:center}
+  .verdict.ok{background:rgba(63,185,80,.12);color:var(--green)}
+  .verdict.bad{background:rgba(248,81,73,.12);color:var(--red)}
+  .verdict.timeout{background:rgba(210,153,34,.14);color:var(--yellow)}
+  .tag.timeout{background:rgba(210,153,34,.2);color:var(--yellow)}
+  .card.timeout::before{background:var(--yellow)!important}
+
+  .panel-box{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px}
+  .panel-box h3{font-size:14px;margin-bottom:14px;color:var(--blue);display:flex;align-items:center;gap:8px}
+
+  .split-body{display:flex;align-items:center;justify-content:center;gap:20px;flex-wrap:wrap}
+  .node{text-align:center}
+  .node .lbl{font-size:12px;color:var(--dim);margin-bottom:6px}
+  .node .ip{font-family:ui-monospace,monospace;font-size:16px;font-weight:700;padding:8px 16px;
+    border-radius:8px;background:var(--panel2);border:1px solid var(--border)}
+  .node.o .ip{color:var(--cyan)} .node.d .ip{color:var(--yellow)}
+  .arrow{font-size:20px;color:var(--dim)}
+  .verdict-line{margin-top:14px;text-align:center;font-size:13px;font-weight:600}
+  .verdict-line.ok{color:var(--green)} .verdict-line.bad{color:var(--red)} .verdict-line.skip{color:var(--dim)}
+
+  /* PPTP */
+  .pptp-stat{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px}
+  .stat{flex:1;min-width:120px;background:var(--panel2);border:1px solid var(--border);
+    border-radius:8px;padding:12px;text-align:center}
+  .stat .num{font-size:24px;font-weight:700;font-family:ui-monospace,monospace}
+  .stat .lbl{font-size:11px;color:var(--dim);margin-top:4px}
+  .num.g{color:var(--green)} .num.r{color:var(--red)} .num.y{color:var(--yellow)} .num.b{color:var(--blue)}
+  .pptp-verdict{padding:10px 14px;border-radius:8px;font-size:13px;font-weight:600;text-align:center}
+  .pptp-verdict.ok{background:rgba(63,185,80,.12);color:var(--green)}
+  .pptp-verdict.bad{background:rgba(248,81,73,.12);color:var(--red)}
+  .pptp-verdict.na{background:var(--panel2);color:var(--dim)}
+  .entries{margin-top:10px;font-family:ui-monospace,monospace;font-size:10.5px;color:var(--dim);
+    background:#0a0e14;border-radius:6px;padding:10px;max-height:120px;overflow:auto;line-height:1.7}
+
+  /* history chart */
+  .chart-wrap{position:relative}
+  .legend{display:flex;gap:16px;font-size:11px;color:var(--dim);margin-bottom:10px;flex-wrap:wrap}
+  .legend span{display:flex;align-items:center;gap:5px}
+  .dot{width:10px;height:3px;border-radius:2px;display:inline-block}
+  svg{width:100%;height:auto;display:block}
+  .hist-empty{color:var(--dim);font-size:13px;text-align:center;padding:30px}
+
+  .spin{width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;
+    border-radius:50%;animation:sp .6s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  /* GRE 醒目告警条 */
+  .gre-alert{background:linear-gradient(90deg,rgba(248,81,73,.22),rgba(248,81,73,.10));
+    border:1.5px solid var(--red);border-radius:10px;padding:14px 18px;margin-bottom:18px;
+    display:flex;align-items:center;gap:12px;animation:ga-flash 1.2s ease-in-out infinite}
+  .gre-alert .ga-ico{font-size:22px}
+  .gre-alert .ga-txt{flex:1;color:#ff9d97;font-weight:600;font-size:14px}
+  .gre-alert .ga-close{background:var(--red);padding:5px 12px;font-size:12px}
+  @keyframes ga-flash{0%,100%{box-shadow:0 0 0 0 rgba(248,81,73,.5)}50%{box-shadow:0 0 14px 3px rgba(248,81,73,.55)}}
+  /* PPTP 状态历史趋势条 */
+  .pptp-hist{margin-top:14px}
+  .pptp-hist .ph-title{font-size:11px;color:var(--dim);margin-bottom:8px;display:flex;justify-content:space-between}
+  .ph-bar{display:flex;gap:2px;height:26px;align-items:stretch;border-radius:6px;overflow:hidden;
+    background:#0a0e14;padding:3px}
+  .ph-cell{flex:1;min-width:2px;border-radius:2px;transition:.2s;cursor:pointer}
+  .ph-cell.ok{background:var(--green)}
+  .ph-cell.bad{background:var(--red)}
+  .ph-cell.na{background:#30363d}
+  .ph-cell:hover{opacity:.7;transform:scaleY(1.15)}
+  .ph-legend{display:flex;gap:14px;font-size:10.5px;color:var(--dim);margin-top:6px}
+  .ph-legend i{width:10px;height:10px;border-radius:2px;display:inline-block;margin-right:4px;vertical-align:middle}
+  /* 探针分组（国内/海外各一行）*/
+  .probe-group{}
+  .pg-label{font-size:12px;color:var(--dim);margin-bottom:8px;display:flex;align-items:center;gap:7px;font-weight:500}
+  .pg-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .pg-dot.oversea{background:var(--cyan)}
+  .pg-dot.domestic{background:var(--yellow)}
+  .footer{margin-top:22px;text-align:center;font-size:11px;color:var(--dim);line-height:1.7}
+  .pulse{width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block;
+    animation:pl 1.5s ease-in-out infinite}
+  @keyframes pl{0%,100%{opacity:1}50%{opacity:.3}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="logo">🌐</span> 出口分流监控看板</h1>
+    <div class="meta">
+      <div id="ts">检测时间：—</div>
+      <div>DNS：<span id="dns">—</span></div>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <button id="run"><span id="run-ico">↻</span> 立即检测（全部刷新）</button>
+    <span class="auto" style="font-size:12px;color:var(--dim)">出口探针与 PPTP 各自独立自动刷新，见下方分区控件</span>
+  </div>
+
+  <div class="banner wait" id="banner"><span>等待检测…</span></div>
+
+  <!-- GRE 异常醒目告警条（默认隐藏，状态由正常→异常时弹出）-->
+  <div id="gre-alert" class="gre-alert" style="display:none">
+    <span class="ga-ico">🚨</span>
+    <span class="ga-txt">PPTP/GRE 隧道异常！</span>
+    <button class="ga-close" onclick="dismissGreAlert()">✕ 知道了</button>
+  </div>
+
+  <div class="sec-title" style="justify-content:space-between">
+    <span>🛰️ 出口探针</span>
+    <span style="display:flex;align-items:center;gap:10px;text-transform:none;letter-spacing:0">
+      <label class="auto" style="font-size:11px"><input type="checkbox" id="exit-auto"> 自动刷新
+        <select id="exit-interval" class="btn-ghost" style="padding:2px 6px;border-radius:5px;font-size:11px">
+          <option value="30">30秒</option><option value="60" selected>60秒</option><option value="120">120秒</option><option value="300">5分钟</option>
+        </select>
+      </label>
+      <span id="exit-live" style="font-size:11px;color:var(--green);display:none;align-items:center;gap:5px">
+        <span class="pulse"></span>下次 <span id="exit-count">60</span>s
+      </span>
+    </span>
+  </div>
+  <div class="probe-group">
+    <div class="pg-label"><span class="pg-dot oversea"></span>海外出口（应走 USPROXY）</div>
+    <div class="grid" id="cards-oversea"></div>
+  </div>
+  <div class="probe-group" style="margin-top:14px">
+    <div class="pg-label"><span class="pg-dot domestic"></span>国内出口（应走 DIRECT）</div>
+    <div class="grid" id="cards-domestic"></div>
+  </div>
+
+  <div class="sec-title">🔀 分流有效性校验（L3）</div>
+  <div class="panel-box">
+    <div class="split-body">
+      <div class="node o"><div class="lbl">海外出口 (USPROXY)</div><div class="ip" id="oip">—</div></div>
+      <div class="arrow">⇄</div>
+      <div class="node d"><div class="lbl">国内出口 (DIRECT)</div><div class="ip" id="dip">—</div></div>
+    </div>
+    <div class="verdict-line skip" id="split-verdict">等待检测…</div>
+  </div>
+
+  <div class="sec-title" style="justify-content:space-between">
+    <span style="display:flex;align-items:center;gap:8px">🔌 PPTP / GRE 隧道状态</span>
+    <span style="display:flex;align-items:center;gap:10px;text-transform:none;letter-spacing:0">
+      <label class="auto" style="font-size:11px"><input type="checkbox" id="pptp-auto" checked> 自动刷新
+        <select id="pptp-interval" class="btn-ghost" style="padding:2px 6px;border-radius:5px;font-size:11px">
+          <option value="5">5s</option><option value="10" selected>10s</option><option value="30">30s</option>
+        </select>
+      </label>
+      <span id="pptp-live" style="font-size:11px;color:var(--green);display:flex;align-items:center;gap:5px">
+        <span class="pulse"></span><span id="pptp-count">10</span>s
+      </span>
+      <button id="pptp-refresh" class="btn-ghost" style="padding:4px 10px;font-size:11px">↻ 刷新</button>
+    </span>
+  </div>
+  <div class="panel-box">
+    <div style="font-size:11px;color:var(--dim);margin-bottom:12px" id="pptp-ts">最后更新：—</div>
+    <div class="pptp-stat">
+      <div class="stat"><div class="num b" id="p-total">—</div><div class="lbl">拨入客户端总数</div></div>
+      <div class="stat"><div class="num g" id="p-ok">—</div><div class="lbl">隧道已打通</div></div>
+      <div class="stat"><div class="num r" id="p-pending">—</div><div class="lbl">待打通(仅去程)</div></div>
+      <div class="stat"><div class="num y" id="p-c1723">—</div><div class="lbl">已建控制通道(1723)</div></div>
+    </div>
+    <div style="font-size:11px;color:var(--dim);margin:8px 0 4px" id="p-raw">
+      原始 conntrack 条目：GRE 总 — / replied — / UNREPLIED — / TCP1723 —（诊断参考）
+    </div>
+    <div style="font-size:11px;color:var(--dim);margin-bottom:8px" id="p-cips"></div>
+    <div class="pptp-verdict na" id="pptp-verdict">等待检测…</div>
+    <div class="entries" id="pptp-entries" style="display:none"></div>
+
+    <div class="pptp-hist">
+      <div class="ph-title">
+        <span>📶 最近状态趋势（每次轮询一格，最新在右）</span>
+        <span id="ph-count">—</span>
+      </div>
+      <div class="ph-bar" id="ph-bar"></div>
+      <div class="ph-legend">
+        <span><i style="background:var(--green)"></i>正常(replied)</span>
+        <span><i style="background:var(--red)"></i>异常(仅UNREPLIED)</span>
+        <span><i style="background:#30363d"></i>无连接</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec-title">📈 历史趋势（出口延迟 + 分流状态）</div>
+  <div class="panel-box chart-wrap">
+    <div class="legend">
+      <span><i class="dot" style="background:var(--cyan)"></i>海外出口延迟</span>
+      <span><i class="dot" style="background:var(--yellow)"></i>国内出口延迟</span>
+      <span><i class="dot" style="background:var(--green)"></i>正常</span>
+      <span><i class="dot" style="background:var(--red)"></i>异常</span>
+    </div>
+    <div id="chart"><div class="hist-empty">暂无历史数据，多检测几次后显示趋势曲线</div></div>
+  </div>
+
+  <div class="footer">
+    判定分层：<b>L1</b> DNS解析(纯socket) · <b>L2</b> 出口响应 · <b>L4</b> 归属地 · <b>L3</b> 分流对比 · <b>PPTP</b> conntrack<br>
+    核心结论不依赖外部归属地API — 归属地查询失败不影响 L1/L2/L3 判定
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+// 健壮 JSON 拉取：非 2xx 或非 JSON 时抛出可读错误（含服务器返回片段），避免笼统的 JSON.parse 报错
+async function fetchJSON(url, timeoutMs=65000){
+  // AbortController 超时控制：超时主动中断，给出友好提示而非无限等待
+  const ctrl = new AbortController();
+  const tid = setTimeout(()=>ctrl.abort(), timeoutMs);
+  let r, text, ct;
+  try{
+    r = await fetch(url, {cache:'no-store', signal:ctrl.signal});
+    ct = r.headers.get('content-type') || '';
+    text = await r.text();
+  }catch(e){
+    if(e.name === 'AbortError') throw new Error(`请求超时（>${Math.round(timeoutMs/1000)}秒），探针可能正在处理或链路拥塞，请稍后重试`);
+    throw e;
+  }finally{
+    clearTimeout(tid);
+  }
+  if(!r.ok){
+    // 非 2xx：多为 nginx 502/504 或探针错误，截取前 120 字符提示
+    const snip = text.replace(/<[^>]+>/g,'').trim().slice(0,120);
+    throw new Error(`HTTP ${r.status} ${r.statusText}${snip ? ' — '+snip : ''}`);
+  }
+  if(ct.indexOf('application/json') === -1){
+    const snip = text.replace(/<[^>]+>/g,'').trim().slice(0,120);
+    throw new Error(`返回非 JSON（可能是 nginx 错误页或探针未响应）：${snip || '(空)'}`);
+  }
+  try{ return JSON.parse(text); }
+  catch(e){ throw new Error(`JSON 解析失败：${text.slice(0,120)}`); }
+}
+
+function badge(ok){ return ok ? '<span class="lv ok">✔</span>' : '<span class="lv no">✘</span>'; }
+
+function renderCard(p){
+  const roleCn = p.role==='oversea' ? '海外' : '国内';
+  const dnsV = p.resolved ? `<span class="v dns">${p.resolved}</span> ${badge(true)}`
+                          : `<span class="v fail">✘ 解析失败</span> ${badge(false)}`;
+  const exitV = p.exit_ip ? `<span class="v ip">${p.exit_ip}</span> ${badge(true)}`
+                          : `<span class="v fail">✘ 无响应</span> ${badge(false)}`;
+  const latV = (p.latency!=null) ? `<span class="v lat">${p.latency} ms</span>` : `<span class="v dimv">—</span>`;
+  let geoV;
+  if(p.cc){
+    const warn = (p.geo_ok===false) ? ' <span style="color:var(--red)">⚠不符</span>' : ' <span style="color:var(--green)">✔</span>';
+    geoV = `<span class="v">${p.country||''} (${p.cc})</span>${warn}`;
+  } else geoV = `<span class="v dimv">查询失败(不影响判定)</span>`;
+  const verdict = p.ok
+      ? `<div class="verdict ok">══> 通过</div>`
+      : (p.timeout ? `<div class="verdict timeout">⏱ 超时（探测超过硬上限，本次判失败）</div>`
+                   : `<div class="verdict bad">══> 失败</div>`);
+  const toBadge = p.timeout ? `<span class="tag timeout">⏱ 超时</span>` : '';
+  return `<div class="card ${p.role}${p.timeout ? ' timeout' : ''}">
+    <div class="card-head"><span class="domain">${p.domain}</span><span style="display:flex;gap:6px">${toBadge}<span class="tag ${p.role}">预期${roleCn}出口</span></span></div>
+    <div class="row"><span class="k">${badge(!!p.resolved)} L1 解析</span><span>${dnsV}</span></div>
+    <div class="row"><span class="k">${badge(!!p.exit_ip)} L2 出口</span><span>${exitV}</span></div>
+    <div class="row"><span class="k">⏱ 延迟</span><span>${latV}</span></div>
+    <div class="row"><span class="k">L4 归属地</span><span>${geoV}</span></div>
+    ${verdict}</div>`;
+}
+
+function renderPPTP(pp){
+  // 客户端级口径（单位=客户端，三者语义一致可对比）
+  $('#p-total').textContent   = pp.clients_total ?? 0;
+  $('#p-ok').textContent      = pp.clients_ok ?? 0;
+  $('#p-pending').textContent = pp.clients_pending ?? 0;
+  $('#p-c1723').textContent   = pp.clients_1723 ?? 0;
+  // 原始 conntrack 条目数（诊断参考，1客户端通常含多条）
+  $('#p-raw').textContent = `原始 conntrack 条目：GRE 总 ${pp.gre_total} / replied ${pp.gre_replied} / UNREPLIED ${pp.gre_unreplied} / TCP1723 ${pp.tcp1723}（诊断参考，1客户端含多条）`;
+  // 客户端 IP 列表
+  const cips = pp.client_ips || [];
+  $('#p-cips').textContent = cips.length ? ('客户端 IP：' + cips.join('、')) : '';
+  const v=$('#pptp-verdict');
+  if(pp.ok===true){ v.className='pptp-verdict ok'; v.textContent='✔ '+pp.detail; }
+  else if(pp.ok===false){ v.className='pptp-verdict bad'; v.textContent='✘ '+pp.detail; }
+  else { v.className='pptp-verdict na'; v.textContent='ⓘ '+pp.detail; }
+  const e=$('#pptp-entries');
+  if(pp.entries && pp.entries.length){
+    e.style.display='block';
+    e.innerHTML=pp.entries.map(x=>{
+      const safe=x.replace(/</g,'&lt;');
+      // 状态着色：UNREPLIED 红、ASSURED 绿
+      const colored=safe
+        .replace(/\[UNREPLIED\]/g,'<span style="color:var(--red)">[UNREPLIED]</span>')
+        .replace(/\[ASSURED\]/g,'<span style="color:var(--green)">[ASSURED]</span>');
+      return '• '+colored;
+    }).join('<br>');
+  }
+  else e.style.display='none';
+  if(pp.ts) $('#pptp-ts').textContent = '最后更新：'+pp.ts+'（数据源：'+(pp.source||'—')+'）';
+  checkGreAlert(pp);   // 状态跳变告警检测
+}
+
+// ---- GRE 异常告警：状态由「非异常」跳变到「异常(ok===false)」时弹出 ----
+let lastGreOk = undefined;         // 上一次的 pp.ok
+let greAlertDismissed = false;     // 用户是否已手动关闭当前告警
+function checkGreAlert(pp){
+  const nowBad = (pp.ok === false);   // 仅 UNREPLIED 才算异常；null(无连接)不告警
+  const box=$('#gre-alert');
+  if(nowBad){
+    // 从非异常跳变到异常 → 重新弹出（重置 dismissed）
+    if(lastGreOk !== false){ greAlertDismissed=false; }
+    if(!greAlertDismissed){
+      box.style.display='flex';
+      box.querySelector('.ga-txt').textContent =
+        `PPTP/GRE 隧道异常！${pp.detail||''}（${pp.ts||''}）—— 检查 route-exclude-address 是否生效`;
+      beep();
+    }
+  } else {
+    // 恢复正常/无连接 → 收起告警
+    box.style.display='none';
+    if(pp.ok===true && lastGreOk===false){ /* 可扩展：恢复提示 */ }
+  }
+  lastGreOk = pp.ok;
+}
+function dismissGreAlert(){ greAlertDismissed=true; $('#gre-alert').style.display='none'; }
+// 轻量提示音（WebAudio，无需音频文件）
+function beep(){
+  try{
+    const ac=new (window.AudioContext||window.webkitAudioContext)();
+    const o=ac.createOscillator(), g=ac.createGain();
+    o.type='square'; o.frequency.value=740; o.connect(g); g.connect(ac.destination);
+    g.gain.setValueAtTime(0.06,ac.currentTime); o.start();
+    o.stop(ac.currentTime+0.18);
+  }catch(e){}
+}
+
+// ---- PPTP/GRE 独立高频轮询（默认10s，仅读 conntrack，轻量）----
+let pptpTimer=null, pptpCountTimer=null, pptpLeft=10;
+async function pptpProbe(){
+  try{
+    renderPPTP(await fetchJSON('/api/pptp'));
+    loadPptpHistory();
+  }catch(e){
+    const v=$('#pptp-verdict'); v.className='pptp-verdict bad'; v.textContent='✘ PPTP状态获取失败：'+e.message;
+  }
+}
+function pptpStart(){
+  clearInterval(pptpTimer); clearInterval(pptpCountTimer);
+  const sec=parseInt($('#pptp-interval').value,10);
+  pptpLeft=sec; $('#pptp-count').textContent=sec;
+  $('#pptp-live').style.display='flex';
+  pptpProbe();
+  pptpTimer=setInterval(()=>{ pptpProbe(); pptpLeft=sec; }, sec*1000);
+  pptpCountTimer=setInterval(()=>{ pptpLeft=Math.max(0,pptpLeft-1); $('#pptp-count').textContent=pptpLeft; }, 1000);
+}
+function pptpStop(){ clearInterval(pptpTimer); clearInterval(pptpCountTimer); $('#pptp-live').style.display='none'; }
+
+// ---- PPTP 状态历史趋势条 ----
+async function loadPptpHistory(){
+  try{
+    const j=await fetchJSON('/api/pptp_history?n=60');
+    drawPptpHist(j.history||[]);
+  }catch(e){}
+}
+function drawPptpHist(hist){
+  const bar=$('#ph-bar');
+  if(!hist.length){ bar.innerHTML=''; $('#ph-count').textContent='暂无数据'; return; }
+  $('#ph-count').textContent = `共 ${hist.length} 格`;
+  bar.innerHTML = hist.map(h=>{
+    let cls='na', tip;
+    const co = h.clients_ok ?? h.replied, cp = h.clients_pending ?? h.unreplied, ct = h.clients_total ?? h.total;
+    if(h.ok===true){ cls='ok'; tip=`正常 ${co} 个客户端隧道已打通`; }
+    else if(h.ok===false){ cls='bad'; tip=`异常 ${cp} 个客户端仅去程无回包`; }
+    else { cls='na'; tip='无客户端拨入'; }
+    return `<div class="ph-cell ${cls}" title="${h.ts||''}\n${tip}\n客户端总数=${ct??'-'} 控制通道=${h.clients_1723??h.tcp1723??'-'}"></div>`;
+  }).join('');
+}
+
+// ---- 出口探针 + 分流校验 独立自动刷新（默认60s，因探测较慢）----
+let exitTimer=null, exitCountTimer=null, exitLeft=60;
+function exitStart(){
+  clearInterval(exitTimer); clearInterval(exitCountTimer);
+  const sec=parseInt($('#exit-interval').value,10);
+  exitLeft=sec; $('#exit-count').textContent=sec;
+  $('#exit-live').style.display='flex';
+  exitTimer=setInterval(()=>{ probe(); exitLeft=sec; }, sec*1000);
+  exitCountTimer=setInterval(()=>{ exitLeft=Math.max(0,exitLeft-1); $('#exit-count').textContent=exitLeft; }, 1000);
+}
+function exitStop(){ clearInterval(exitTimer); clearInterval(exitCountTimer); $('#exit-live').style.display='none'; }
+
+function render(d){
+  $('#ts').textContent='检测时间：'+d.ts;
+  $('#dns').textContent=d.dns;
+  const ov=d.probes.filter(x=>x.role==='oversea'), dm=d.probes.filter(x=>x.role==='domestic');
+  $('#cards-oversea').innerHTML  = ov.length ? ov.map(renderCard).join('') : '<div style="color:var(--dim);font-size:12px;padding:8px">无海外探针</div>';
+  $('#cards-domestic').innerHTML = dm.length ? dm.map(renderCard).join('') : '<div style="color:var(--dim);font-size:12px;padding:8px">无国内探针</div>';
+  const s=d.summary,b=$('#banner');
+  if(s.all_ok){ b.className='banner ok'; b.innerHTML=`<span class="big">✔</span><span>全部通过 (${s.passed}/${s.total}) — 双出口分流与DNS解析均正常</span>`; }
+  else { b.className='banner bad'; b.innerHTML=`<span class="big">✘</span><span>存在异常：通过 ${s.passed} / 失败 ${s.failed}（共${s.total}项）</span>`; }
+  const sp=d.split;
+  $('#oip').textContent=sp.oversea_exit||'—';
+  $('#dip').textContent=sp.domestic_exit||'—';
+  const sv=$('#split-verdict');
+  if(sp.ok===true){ sv.className='verdict-line ok'; sv.textContent='✔ '+sp.msg; }
+  else if(sp.ok===false){ sv.className='verdict-line bad'; sv.textContent='✘ '+sp.msg; }
+  else { sv.className='verdict-line skip'; sv.textContent=sp.msg; }
+  // PPTP 卡片由独立高频轮询(pptpProbe)管理，此处不再覆盖，避免慢探测数据顶掉10s实时值
+}
+
+// ---- 历史趋势 SVG 折线图 ----
+function drawChart(hist){
+  const box=$('#chart');
+  if(!hist || hist.length<2){ box.innerHTML='<div class="hist-empty">暂无足够历史数据，多检测几次后显示趋势曲线</div>'; return; }
+  const W=1040,H=220,pad={l:44,r:16,t:16,b:28};
+  const iw=W-pad.l-pad.r, ih=H-pad.t-pad.b;
+  const lat=[]; hist.forEach(h=>{ if(h.oversea_latency!=null)lat.push(h.oversea_latency); if(h.domestic_latency!=null)lat.push(h.domestic_latency); });
+  const maxY=Math.max(100,...lat)*1.15, n=hist.length;
+  const x=i=> pad.l + (n===1?0:iw*i/(n-1));
+  const y=v=> pad.t + ih - ih*Math.min(v,maxY)/maxY;
+  const line=(key,color)=>{
+    let dpath='',pts='';
+    hist.forEach((h,i)=>{ const v=h[key]; if(v==null)return;
+      dpath += (dpath===''?'M':'L')+x(i).toFixed(1)+' '+y(v).toFixed(1)+' ';
+      pts += `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.5" fill="${color}"/>`; });
+    return `<path d="${dpath}" fill="none" stroke="${color}" stroke-width="2"/>${pts}`;
+  };
+  // Y 轴网格
+  let grid='';
+  for(let g=0;g<=4;g++){ const gy=pad.t+ih*g/4, val=Math.round(maxY*(4-g)/4);
+    grid+=`<line x1="${pad.l}" y1="${gy}" x2="${W-pad.r}" y2="${gy}" stroke="#30363d" stroke-width="1" stroke-dasharray="3 3"/>`;
+    grid+=`<text x="${pad.l-6}" y="${gy+4}" fill="#8b949e" font-size="10" text-anchor="end">${val}</text>`; }
+  // 底部状态点（分流/整体）
+  let status='';
+  hist.forEach((h,i)=>{ const ok=h.all_ok && h.split_ok!==false;
+    status+=`<circle cx="${x(i).toFixed(1)}" cy="${H-8}" r="3" fill="${ok?'#3fb950':'#f85149'}"/>`; });
+  // X 轴首末时间
+  const t0=(hist[0].ts||'').slice(11,16), t1=(hist[n-1].ts||'').slice(11,16);
+  box.innerHTML=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
+    ${grid}${line('oversea_latency','#39c5cf')}${line('domestic_latency','#d29922')}${status}
+    <text x="${pad.l}" y="${H-2}" fill="#8b949e" font-size="10">${t0}</text>
+    <text x="${W-pad.r}" y="${H-2}" fill="#8b949e" font-size="10" text-anchor="end">${t1}</text>
+    <text x="${W/2}" y="${H-2}" fill="#8b949e" font-size="10" text-anchor="middle">最近 ${n} 次 · 底部圆点=整体状态</text>
+  </svg>`;
+}
+
+async function loadHistory(){
+  try{ drawChart((await fetchJSON('/api/history?n=50')).history); }catch(e){}
+}
+
+async function probe(){
+  const btn=$('#run'),ico=$('#run-ico');
+  btn.disabled=true; if(ico) ico.outerHTML='<span class="spin" id="run-ico"></span>';
+  $('#banner').className='banner wait';
+  $('#banner').innerHTML='<span class="spin"></span><span>正在检测出口分流与隧道状态…（约 5–20 秒）</span>';
+  try{ render(await fetchJSON('/api/probe')); await loadHistory(); }
+  catch(e){ $('#banner').className='banner bad'; $('#banner').innerHTML='<span class="big">✘</span><span>检测请求失败：'+e.message+'</span>'; }
+  finally{ const s=$('#run-ico'); if(s) s.outerHTML='<span id="run-ico">↻</span>'; $('#run').disabled=false; }
+}
+
+$('#run').addEventListener('click',()=>{ probe(); pptpProbe(); });  // 立即检测：出口+PPTP+历史 全部刷新一次
+
+// PPTP 独立刷新控件
+$('#pptp-refresh').addEventListener('click',pptpProbe);
+$('#pptp-auto').addEventListener('change',e=>{ e.target.checked ? pptpStart() : pptpStop(); });
+$('#pptp-interval').addEventListener('change',()=>{ if($('#pptp-auto').checked) pptpStart(); });
+
+// 出口探针独立刷新控件
+$('#exit-auto').addEventListener('change',e=>{ e.target.checked ? exitStart() : exitStop(); });
+$('#exit-interval').addEventListener('change',()=>{ if($('#exit-auto').checked) exitStart(); });
+
+probe(); loadHistory();
+pptpStart();       // 启动 PPTP/GRE 独立高频轮询（默认10s）
+loadPptpHistory(); // 首次加载 PPTP 状态趋势条
+</script>
+</body>
+</html>

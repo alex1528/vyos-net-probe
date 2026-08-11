@@ -1,0 +1,25 @@
+# ===== 运行时产物（探针服务生成，不入库）=====
+history.jsonl
+pptp_history.jsonl
+*.jsonl
+
+# ===== 编辑器/预览快照 =====
+.versions/
+.vscode/
+.idea/
+
+# ===== Python 缓存 =====
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# ===== 系统/临时文件 =====
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+*.log
+
+# ===== 本地提交脚本（不入库）=====
+commit.sh
