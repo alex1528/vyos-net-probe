@@ -33,10 +33,11 @@ done
 # 2) 安装文件
 info "安装到 ${DST_DIR}…"
 mkdir -p "$DST_DIR"
-cp -f "$SRC_DIR/probe_server.py" "$DST_DIR/"
-cp -f "$SRC_DIR/index.html"      "$DST_DIR/"
-chmod +x "$DST_DIR/probe_server.py"
-ok "文件已同步"
+cp -f "$SRC_DIR/probe_server.py"  "$DST_DIR/"
+cp -f "$SRC_DIR/index.html"       "$DST_DIR/"
+cp -f "$SRC_DIR/ensure_nginx.sh"  "$DST_DIR/"
+chmod +x "$DST_DIR/probe_server.py" "$DST_DIR/ensure_nginx.sh"
+ok "文件已同步（含 nginx 引导脚本 ensure_nginx.sh）"
 
 # 3) 安装 systemd 服务
 info "安装 systemd 服务 probe…"
@@ -69,6 +70,9 @@ if [ -d "$NGX_AVAIL" ] && [ -d "$NGX_ENABLED" ]; then
     ok "已安装站点软链 $NGX_ENABLED/vyos-net-probe（未改动任何现有站点）"
 
     if nginx -t 2>/dev/null; then
+        # 注：不做 systemctl enable nginx —— VyOS 靠 config.boot 驱动 nginx，不依赖 systemd enable。
+        # 本项目的开机自启由 probe 服务(已 enable)的 ExecStartPre=ensure_nginx.sh 保障：
+        # 每次开机 probe 启动前会自动补软链并确保 nginx 运行，不依赖 VyOS 是否启用 service https。
         # nginx 运行中则 reload，未运行则 start（reload 对未运行的服务会报错）
         if systemctl is-active --quiet nginx; then
             systemctl reload nginx

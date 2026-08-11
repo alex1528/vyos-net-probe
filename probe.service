@@ -7,16 +7,22 @@ Wants=network-online.target
 Type=simple
 # 探针服务安装目录（部署脚本会同步到此路径）
 WorkingDirectory=/opt/vyos-net-probe
+# 启动前引导：确保 nginx 站点软链存在且 nginx 运行（模拟 VyOS 托管，不依赖 service https）
+# 前缀 '+' 让该命令以完整 root 权限运行，不受下方沙箱(ProtectSystem)限制，从而可管理 nginx
+ExecStartPre=+/bin/bash /opt/vyos-net-probe/ensure_nginx.sh
 ExecStart=/usr/bin/python3 /opt/vyos-net-probe/probe_server.py
 Environment=PROBE_HOST=127.0.0.1
 Environment=PROBE_PORT=8899
 Environment=PROBE_DNS=127.0.0.1
+# 软链自愈检查间隔(秒)，0=关闭；防 VyOS commit/升级覆盖后本站点软链失效
+Environment=PROBE_SELF_HEAL_INTERVAL=300
 Restart=on-failure
 RestartSec=3
-# 安全加固（探针只需读+网络，无需写系统）
+# 安全加固（主服务仅需读+网络，无需写系统；ExecStartPre 用 '+' 豁免以管理 nginx）
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/vyos-net-probe
+# 主进程软链自愈需写 sites-enabled；探针历史写安装目录
+ReadWritePaths=/opt/vyos-net-probe /etc/nginx/sites-enabled
 
 [Install]
 WantedBy=multi-user.target

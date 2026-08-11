@@ -672,9 +672,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}, ensure_ascii=False))
 
 
+# 软链周期自愈：防止 VyOS commit/升级重写 nginx 配置后，本站点软链失效
+NGINX_SITE_LINK = "/etc/nginx/sites-enabled/vyos-net-probe"
+NGINX_SITE_SRC  = "/etc/nginx/sites-available/vyos-net-probe"
+# 自愈间隔秒(0=关闭)；默认 300s。VyOS 场景下建议保持开启。
+SELF_HEAL_INTERVAL = int(os.environ.get("PROBE_SELF_HEAL_INTERVAL", "300"))
+
+
+def _selfheal_symlink_loop():
+    """后台守护：周期检查站点软链，缺失则重建并 reload nginx（幂等、静默）。"""
+    import subprocess as _sp
+    while True:
+        try:
+            time.sleep(SELF_HEAL_INTERVAL)
+            # 源配置在、但软链丢失 → 重建 + reload
+            if os.path.isfile(NGINX_SITE_SRC) and not os.path.islink(NGINX_SITE_LINK) \
+               and not os.path.exists(NGINX_SITE_LINK):
+                os.symlink(NGINX_SITE_SRC, NGINX_SITE_LINK)
+                # 校验通过再 reload，避免影响现有 nginx
+                if _sp.run(["nginx", "-t"], capture_output=True).returncode == 0:
+                    _sp.run(["systemctl", "reload", "nginx"], capture_output=True)
+                print("[self-heal] 站点软链丢失，已重建并 reload nginx")
+        except Exception:
+            # 守护线程绝不因异常退出（如无权限），静默continue
+            pass
+
+
 def main():
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     print(f"[probe_server v2.0] http://{LISTEN_HOST}:{LISTEN_PORT}  DNS={DNS_SERVER}")
+    # 启动软链自愈守护线程（daemon，随主进程退出）
+    if SELF_HEAL_INTERVAL > 0:
+        import threading
+        threading.Thread(target=_selfheal_symlink_loop, daemon=True).start()
+        print(f"[probe_server] 软链自愈守护已启动（每 {SELF_HEAL_INTERVAL}s 检查）")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

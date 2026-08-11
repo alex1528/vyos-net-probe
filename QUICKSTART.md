@@ -64,6 +64,8 @@ systemctl restart probe         # 重启（改配置/换探针域名后）
 journalctl -u probe -f          # 实时日志
 ```
 
+> **nginx 由 probe 服务托管**：`systemctl enable probe` 后，每次开机 probe 会自动拉起 nginx 并补站点软链（`ExecStartPre=ensure_nginx.sh`），运行时守护线程每 5 分钟自愈软链——不依赖 VyOS 是否启用 `service https`。已运行的 nginx 只 reload 不抢管理权。
+
 ### API 一览
 
 | 路径 | 说明 |

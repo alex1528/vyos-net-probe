@@ -45,7 +45,8 @@ git commit -m "feat: 出口分流监控探针"             # pre-commit 校验 +
 |------|------|
 | `probe_server.py` | 探针 HTTP 服务，提供 `/api/probe` JSON 与内置前端 |
 | `index.html` | 暗色主题看板前端（零外部依赖） |
-| `probe.service` | systemd 服务单元 |
+| `probe.service` | systemd 服务单元（含 ExecStartPre 引导 + 自愈间隔环境变量） |
+| `ensure_nginx.sh` | nginx 引导脚本（软链自愈 + 智能共存，由 probe 服务开机调用） |
 | `vyos-net-probe.conf` | 独立 nginx 站点配置（监听8080，根路径/） |
 | `deploy.sh` | 一键部署脚本（安装文件 + 起服务 + 自检） |
 
@@ -123,6 +124,22 @@ PROBES = [
 ```
 
 改后 `sudo systemctl restart probe`。
+
+## nginx 托管机制（不依赖 VyOS service https）
+
+VyOS 靠 `config.boot` + `service_https.py` 驱动 nginx，不用 `systemctl enable nginx`。本项目**不依赖 VyOS 是否启用 `set service https`**，由 probe 服务自行保障 nginx 与站点软链，三层协同：
+
+| 层 | 机制 | 时机 | 作用 |
+|----|------|------|------|
+| 开机引导 | `probe.service` 的 `ExecStartPre=+ensure_nginx.sh` | 每次 probe 启动（含开机，因 probe 已 `systemctl enable`） | 补软链 + 确保 nginx 运行 |
+| 智能共存 | `ensure_nginx.sh` 判断 `systemctl is-active nginx` | 引导时 | nginx 已运行（VyOS 托管/已启动）则只 reload 不抢；未运行才 start |
+| 运行时自愈 | `probe_server.py` 后台守护线程 | 每 `PROBE_SELF_HEAL_INTERVAL` 秒（默认 300，0=关闭） | 软链被 VyOS commit 覆盖后自动重建 + reload |
+
+**权限**：`ExecStartPre` 用 `+` 前缀以完整 root 权限运行（豁免 `ProtectSystem=strict` 沙箱）；主进程自愈线程通过 `ReadWritePaths=... /etc/nginx/sites-enabled` 放行。
+
+**效果**：`systemctl enable probe` 后，每次开机 probe 自启 → 拉起 nginx + 补软链 → 运行时守护保软链 → 看板 `http://<网关IP>:8080/` 始终可用，与 VyOS 是否启用 https 无关。
+
+> ⚠️ 不做 `systemctl enable nginx` —— VyOS 用 config.boot 驱动 nginx，systemd enable 无意义且可能与 VyOS 管理冲突。
 
 ## 注意
 
