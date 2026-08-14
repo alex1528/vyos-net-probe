@@ -54,20 +54,58 @@ GRE_TIMEOUT_STATE = 47      # gre 协议号
 
 # 探针清单：role=oversea 应走海外USPROXY / domestic 应走国内DIRECT
 #   want: "!CN"=期望非中国出口 / "CN"=期望中国出口
-PROBES = [
-    # 海外探针（应走 USPROXY，返回代理出口海外 IP）——全部返回纯 IP，L2 提取零歧义
+# =====================================================================
+# 探针清单：自动检测 mihomo 配置，动态切换两出口/三出口模式
+# 检测逻辑：读 mihomo config.yaml → 若有 HKPROXY 代理组 → 三出口(美国+香港+国内)
+#                                   → 若只有 USPROXY   → 两出口(海外+国内)
+
+# 环境变量 MIHOMO_CONFIG_PATH 可指定配置路径(默认 /etc/mihomo/config.yaml)
+# =====================================================================
+MIHOMO_CONFIG_PATH = os.environ.get("MIHOMO_CONFIG_PATH", "/etc/mihomo/config.yaml")
+# 三出口模式(USPROXY + HKPROXY + DIRECT)
+
+PROBES_3EXIT = [
+    # 美国出口（USPROXY，域名在 oversea.yaml）
+    {"domain": "ifconfig.me",    "expect": "美国", "want": "!CN", "role": "us"},
+    {"domain": "api.ip.sb",      "expect": "美国", "want": "!CN", "role": "us"},
+    {"domain": "icanhazip.com",  "expect": "美国", "want": "!CN", "role": "us"},
+    # 香港出口（HKPROXY，不在 oversea 也不在 DIRECT → 兜底 MATCH,HKPROXY）
+    {"domain": "ifconfig.io",    "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "ifconfig.co",    "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "ipify.org",      "expect": "香港", "want": "!CN", "role": "hk"},
+    # 国内出口（DIRECT，rules 显式）
+    {"domain": "ipinfo.io/ip",   "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "myip.com",       "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ipapi.co",       "expect": "国内", "want": "CN",  "role": "domestic"},
+]
+
+# 两出口模式(USPROXY + DIRECT)
+PROBES_2EXIT = [
+    # 海外出口（USPROXY，域名在 oversea.yaml）
     {"domain": "ifconfig.me",    "expect": "海外", "want": "!CN", "role": "oversea"},
     {"domain": "api.ip.sb",      "expect": "海外", "want": "!CN", "role": "oversea"},
     {"domain": "icanhazip.com",  "expect": "海外", "want": "!CN", "role": "oversea"},
-    # 国内探针（应走 DIRECT，返回网关本机国内出口 IP）——全部返回纯 IP
+    # 国内出口（DIRECT，兜底 MATCH,DIRECT）
     {"domain": "ifconfig.io",    "expect": "国内", "want": "CN",  "role": "domestic"},
-    {"domain": "ip.3322.net",    "expect": "国内", "want": "CN",  "role": "domestic"},
     {"domain": "ipinfo.io/ip",   "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ipapi.co",       "expect": "国内", "want": "CN",  "role": "domestic"},
 ]
 
+def _detect_exit_mode():
+    """检测 mihomo 配置中的出口模式：三出口(有HKPROXY) or 两出口(仅USPROXY)。
+    返回 3 或 2。检测失败时默认 3（三出口,信息量更大）。"""
+    try:
+        with open(MIHOMO_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = f.read()
+        if "name: HKPROXY" in cfg or "- HKPROXY" in cfg:
+            return 3
+        return 2
+    except Exception:
+        return 3
+EXIT_MODE = _detect_exit_mode()
+PROBES = PROBES_3EXIT if EXIT_MODE == 3 else PROBES_2EXIT
 # PPTP VPN 服务器 IP（用于在 conntrack 中过滤 GRE 条目）
 VPN_IPS = ["61.160.251.125", "36.154.11.187"]
-
 
 def _detect_gateway_ips():
     """探测网关本机 IP（用于从客户端统计中排除网关自身）。
@@ -85,14 +123,10 @@ def _detect_gateway_ips():
         if x:
             ips.add(x)
     return ips
-
-
 # 网关自身 IP 集合（客户端去重时排除，避免把网关误算成客户端）
 GATEWAY_IPS = _detect_gateway_ips()
-
 IPV4_RE = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 IPV4_FULL = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
-
 
 # =====================================================================
 # L1：纯 socket DNS 查询（替代 dig，零外部依赖）
@@ -157,7 +191,6 @@ def dns_query_a(domain, server=DNS_SERVER, port=53, timeout=3):
         return None
     return None
 
-
 def sh(cmd, timeout):
     """执行外部命令，返回 (rc, stdout_stripped)。"""
     try:
@@ -165,8 +198,7 @@ def sh(cmd, timeout):
         return p.returncode, p.stdout.strip()
     except Exception:
         return -1, ""
-
-
+    
 # =====================================================================
 # L2：出口 IP 探测 + 延迟
 # =====================================================================
@@ -180,8 +212,6 @@ def get_exit_ip(domain):
     if m:
         return m.group(0), latency
     return None, None
-
-
 # =====================================================================
 # L4：归属地查询（多源冗余，走国内直连）
 # =====================================================================
@@ -196,7 +226,6 @@ CC_ZH = {
     "AE": "阿联酋", "ZA": "南非", "MX": "墨西哥", "PL": "波兰", "UA": "乌克兰",
 }
 
-
 def _geo_ipapi(ip):
     """ip-api.com（国内直连快，带中文国名）→ (cc, 中文名) 或 None。"""
     rc, out = sh(["curl", "-s", "--max-time", "5",
@@ -209,7 +238,6 @@ def _geo_ipapi(ip):
             pass
     return None
 
-
 def _geo_baidu(ip):
     """百度企服（国内兜底）→ (cc, 中文名) 或 None。"""
     rc, out = sh(["curl", "-s", "--max-time", "5",
@@ -220,7 +248,6 @@ def _geo_baidu(ip):
             country = m.group(1)
             return ("CN" if country == "中国" else "XX"), country
     return None
-
 
 def _geo_ipinfo(ip):
     """ipinfo.io 公开接口（对海外 IP 判定权威）→ (cc, 中文名) 或 None。country 为两字母码。"""
@@ -234,7 +261,6 @@ def _geo_ipinfo(ip):
         except Exception:
             pass
     return None
-
 
 def geo_lookup(ip, prefer_oversea=False):
     """
@@ -252,7 +278,6 @@ def geo_lookup(ip, prefer_oversea=False):
         if r and r[0]:
             return r
     return None, None
-
 
 # =====================================================================
 # PPTP/GRE 状态：读 /proc/net/nf_conntrack（零 conntrack 命令依赖）
@@ -279,7 +304,6 @@ def pptp_status():
     if not lines:
         result["detail"] = "无法读取 conntrack（/proc/net/nf_conntrack 不存在且无 conntrack 命令）"
         return result
-
     # 按客户端 IP 去重统计（关键修正）：
     #   conntrack 中 1 个客户端会产生多条记录（去程GRE + 回程GRE + TCP1723），
     #   直接累加"条目数"会导致三个数字天然不等且远大于真实客户端数。
@@ -323,13 +347,11 @@ def pptp_status():
         if state:
             parts.append("[" + state + "]")
         return "  ".join(parts)
-
     for ln in lines:
         fields = ln.split()
         is_gre = "gre" in fields[:3]
         # 是否与本 VPN 相关（含 VPN 服务器 IP 字面量）
         related_vpn = (not VPN_IPS) or any(ip in ln for ip in VPN_IPS)
-
         if is_gre:
             # 关键修正：GRE(协议47)在网关上几乎只有 PPTP 在用。
             #   经 NAT/MASQUERADE 后 GRE 的源/目的地址可能被改写，不再含 VPN_IP 字面量，
@@ -348,14 +370,12 @@ def pptp_status():
                     client_gre_unreplied.add(cip)
                 else:
                     client_gre_replied.add(cip)
-
         # TCP 1723 控制通道：客户端直连不经 NAT 改写源，可用 related_vpn 精确过滤
         if ("sport=1723" in ln or "dport=1723" in ln) and related_vpn:
             result["tcp1723"] += 1
             cip = client_ip_of(ln)
             if is_client(cip):
                 client_1723.add(cip)
-
     # 若某客户端既有 replied 又有 unreplied 记录，视为已连通（replied 优先）
     client_gre_unreplied -= client_gre_replied
     # 客户端级统计（仅供展示参考——NAT 环境下 GRE 源地址可能被改写，客户端归并为尽力而为）
@@ -365,7 +385,6 @@ def pptp_status():
     result["clients_pending"] = len(client_gre_unreplied)
     result["clients_1723"] = len(client_1723)
     result["client_ips"] = sorted(all_clients)
-
     # ================== 判定逻辑（基于原始条目级 GRE 状态，可靠）==================
     # 关键修正：PPTP 是否正常 = 系统中是否存在 replied 的 GRE 条目，
     #   不依赖"GRE 能否归并到具体客户端"（NAT/MASQUERADE 会改写 GRE 源地址，
@@ -374,13 +393,11 @@ def pptp_status():
     has_replied_gre  = result["gre_replied"] > 0     # 原始条目级：存在双向 GRE
     has_any_gre      = result["gre_total"] > 0
     has_1723         = result["tcp1723"] > 0
-
     # 展示用"客户端数"兜底：若能归并到客户端就用客户端数，否则回退到"存在即为1"
     if result["clients_ok"] == 0 and has_replied_gre:
         result["clients_ok"] = 1          # GRE 通但源被NAT改写，按存在计为至少1个
     if result["clients_total"] == 0 and (has_any_gre or has_1723):
         result["clients_total"] = 1
-
     if has_replied_gre:
         result["ok"] = True
         result["detail"] = f"PPTP 隧道已打通（GRE 双向回包 replied={result['gre_replied']}）"
@@ -400,7 +417,6 @@ def pptp_status():
         result["ok"] = None
         result["detail"] = "当前无客户端拨入"
     return result
-
 
 # =====================================================================
 # 执行全部探针
@@ -438,15 +454,14 @@ def _probe_one(pcfg):
                 item["geo_ok"] = True
     return item
 
-
 def run_probes():
     exits = {}
     passed = failed = 0
-
     # 并行执行所有探针(每个探针含 curl 出口 + 归属地，串行累加会超 nginx 超时)
     # 并发后总耗时 ≈ 最慢的单个探针，而非所有探针之和；
     # 并对每个探针设硬超时上限(PROBE_HARD_TIMEOUT)，任一探针卡死不阻塞整体返回。
     from concurrent.futures import ThreadPoolExecutor
+
     def _timeout_item(pcfg):
         # 探针整体超时时的兜底结果(视为该探针失败)
         return {"domain": pcfg["domain"], "expect": pcfg["expect"], "role": pcfg["role"],
@@ -462,7 +477,6 @@ def run_probes():
             except Exception:
                 # 单探针超时/异常 → 兜底为失败项，不影响其他探针与整体返回
                 results[idx] = _timeout_item(PROBES[idx])
-
     # 汇总(保持 PROBES 原始顺序，ex.map 有序返回)
     for item in results:
         if item["exit_ip"]:
@@ -471,7 +485,6 @@ def run_probes():
             passed += 1
         else:
             failed += 1
-
     # L3 分流校验
     split = {"oversea_exit": exits.get("oversea"), "domestic_exit": exits.get("domestic"),
              "ok": None, "msg": ""}
@@ -485,9 +498,7 @@ def run_probes():
             failed += 1
     else:
         split["msg"] = "跳过（有探针未取到出口IP，无法对比）"
-
     pptp = pptp_status()
-
     total = passed + failed
     data = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -501,23 +512,22 @@ def run_probes():
     append_history(data)
     return data
 
-
 # =====================================================================
 # 历史记录
 # =====================================================================
 def append_history(data):
-    """把本次探测的精简摘要追加到 history.jsonl。"""
+    """把本次探测的精简摘要追加到 history.jsonl(动态适配两/三出口)。"""
+    exits = data["split"].get("exits") or {}
     rec = {
         "ts": data["ts"],
-        "oversea_exit": data["split"].get("oversea_exit"),
-        "domestic_exit": data["split"].get("domestic_exit"),
+        "exits": exits,
         "all_ok": data["summary"]["all_ok"],
         "split_ok": data["split"].get("ok"),
         "pptp_ok": data["pptp"].get("ok"),
-        # 各 role 的平均延迟
-        "oversea_latency": _avg_latency(data["probes"], "oversea"),
-        "domestic_latency": _avg_latency(data["probes"], "domestic"),
     }
+    roles = set(p["role"] for p in data["probes"])
+    for role in roles:
+        rec[f"{role}_latency"] = _avg_latency(data["probes"], role)
     try:
         with open(HISTORY_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -525,56 +535,9 @@ def append_history(data):
     except Exception:
         pass
 
-
-def _trim_by_age(path, days=HISTORY_RETENTION_DAYS, per_day=1440, buffer_ratio=1.1):
-    """
-    按时间保留最近 `days` 天的历史记录，控制文件大小不无限增长。
-    - 时间窗：删除早于 (now - days) 的记录（利用 'YYYY-MM-DD HH:MM:SS' 字典序=时间序）
-    - 性能：仅当行数超过「预期条数 × buffer_ratio」才真正解析裁剪，平时快速跳过
-    - 硬上限：裁剪后仍超上限则强制截断（防御时钟回拨/异常高频写入）
-    """
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        return
-    except Exception:
-        return
-    if not lines:
-        return
-
-    hard_max = int(days * per_day * buffer_ratio)
-    # 未超阈值 → 快速返回，不解析（绝大多数调用走这里）
-    if len(lines) <= hard_max:
-        return
-
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    keep_from = len(lines)  # 默认：全部过期则清空
-    for i, ln in enumerate(lines):
-        try:
-            ts = json.loads(ln).get("ts") or ""
-        except Exception:
-            ts = ""
-        # 时间戳格式统一，可直接字符串比较；无 ts 的行视为过期跳过
-        if ts and ts >= cutoff:
-            keep_from = i
-            break
-    trimmed = lines[keep_from:]
-    # 硬上限兜底
-    if len(trimmed) > hard_max:
-        trimmed = trimmed[-hard_max:]
-    if len(trimmed) != len(lines):
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.writelines(trimmed)
-        except Exception:
-            pass
-
-
 def _avg_latency(probes, role):
     vals = [p["latency"] for p in probes if p["role"] == role and p["latency"] is not None]
     return int(sum(vals) / len(vals)) if vals else None
-
 
 def read_history(n=50):
     try:
@@ -583,7 +546,6 @@ def read_history(n=50):
         return [json.loads(x) for x in lines if x.strip()]
     except Exception:
         return []
-
 
 def append_pptp_history(pp):
     """把每次 PPTP 轮询的精简状态追加到 pptp_history.jsonl（供状态趋势条）。"""
@@ -601,7 +563,6 @@ def append_pptp_history(pp):
     except Exception:
         pass
 
-
 def read_pptp_history(n=60):
     try:
         with open(PPTP_HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -609,8 +570,7 @@ def read_pptp_history(n=60):
         return [json.loads(x) for x in lines if x.strip()]
     except Exception:
         return []
-
-
+    
 # =====================================================================
 # HTTP 服务
 # =====================================================================
@@ -661,6 +621,16 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             n = int(q.get("n", ["60"])[0])
             self._send(200, json.dumps({"history": read_pptp_history(n)}, ensure_ascii=False))
+        elif path == "/api/mode":
+            # 返回当前出口模式、探针列表、检测到的配置路径(供调试/前端自适应)
+            mode_info = {
+                "exit_mode": EXIT_MODE,
+                "mode_label": "三出口(美国+香港+国内)" if EXIT_MODE == 3 else "两出口(海外+国内)",
+                "config_path": MIHOMO_CONFIG_PATH,
+                "roles": sorted(set(p["role"] for p in PROBES)),
+                "probes": PROBES,
+            }
+            self._send(200, json.dumps(mode_info, ensure_ascii=False))
         elif path in ("/", "/index.html"):
             idx = os.path.join(BASE_DIR, "index.html")
             if os.path.isfile(idx):
@@ -670,14 +640,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "<h1>index.html not found</h1>", "text/html; charset=utf-8")
         else:
             self._send(404, json.dumps({"error": "not found"}, ensure_ascii=False))
-
-
 # 软链周期自愈：防止 VyOS commit/升级重写 nginx 配置后，本站点软链失效
 NGINX_SITE_LINK = "/etc/nginx/sites-enabled/vyos-net-probe"
 NGINX_SITE_SRC  = "/etc/nginx/sites-available/vyos-net-probe"
 # 自愈间隔秒(0=关闭)；默认 300s。VyOS 场景下建议保持开启。
 SELF_HEAL_INTERVAL = int(os.environ.get("PROBE_SELF_HEAL_INTERVAL", "300"))
-
 
 def _selfheal_symlink_loop():
     """后台守护：周期检查站点软链，缺失则重建并 reload nginx（幂等、静默）。"""
@@ -697,7 +664,6 @@ def _selfheal_symlink_loop():
             # 守护线程绝不因异常退出（如无权限），静默continue
             pass
 
-
 def main():
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     print(f"[probe_server v2.0] http://{LISTEN_HOST}:{LISTEN_PORT}  DNS={DNS_SERVER}")
@@ -710,7 +676,6 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         srv.shutdown()
-
 
 if __name__ == "__main__":
     main()

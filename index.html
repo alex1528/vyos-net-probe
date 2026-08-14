@@ -44,13 +44,9 @@
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;
     position:relative;overflow:hidden}
   .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px}
-  .card.oversea::before{background:var(--cyan)}
-  .card.domestic::before{background:var(--yellow)}
   .card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
   .domain{font-size:15px;font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace}
   .tag{font-size:11px;padding:3px 9px;border-radius:20px;font-weight:600}
-  .tag.oversea{background:rgba(57,197,207,.15);color:var(--cyan)}
-  .tag.domestic{background:rgba(210,153,34,.15);color:var(--yellow)}
   .row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;
     border-bottom:1px dashed var(--border);font-size:13px}
   .row:last-of-type{border-bottom:none}
@@ -130,8 +126,10 @@
   .probe-group{}
   .pg-label{font-size:12px;color:var(--dim);margin-bottom:8px;display:flex;align-items:center;gap:7px;font-weight:500}
   .pg-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
-  .pg-dot.oversea{background:var(--cyan)}
+  .pg-dot.us{background:var(--cyan)}
+  .pg-dot.hk{background:var(--purple)}
   .pg-dot.domestic{background:var(--yellow)}
+  .card::before{background:var(--card-accent, var(--dim))}
   .footer{margin-top:22px;text-align:center;font-size:11px;color:var(--dim);line-height:1.7}
   .pulse{width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block;
     animation:pl 1.5s ease-in-out infinite}
@@ -175,22 +173,12 @@
       </span>
     </span>
   </div>
-  <div class="probe-group">
-    <div class="pg-label"><span class="pg-dot oversea"></span>海外出口（应走 USPROXY）</div>
-    <div class="grid" id="cards-oversea"></div>
-  </div>
-  <div class="probe-group" style="margin-top:14px">
-    <div class="pg-label"><span class="pg-dot domestic"></span>国内出口（应走 DIRECT）</div>
-    <div class="grid" id="cards-domestic"></div>
-  </div>
+  <!-- 探针分组容器:由JS根据API返回的roles动态生成(自适应两出口/三出口) -->
+  <div id="probe-groups"></div>
 
   <div class="sec-title">🔀 分流有效性校验（L3）</div>
   <div class="panel-box">
-    <div class="split-body">
-      <div class="node o"><div class="lbl">海外出口 (USPROXY)</div><div class="ip" id="oip">—</div></div>
-      <div class="arrow">⇄</div>
-      <div class="node d"><div class="lbl">国内出口 (DIRECT)</div><div class="ip" id="dip">—</div></div>
-    </div>
+    <div class="split-body" id="split-nodes"><!-- 动态渲染各出口节点 --></div>
     <div class="verdict-line skip" id="split-verdict">等待检测…</div>
   </div>
 
@@ -289,7 +277,7 @@ async function fetchJSON(url, timeoutMs=65000){
 function badge(ok){ return ok ? '<span class="lv ok">✔</span>' : '<span class="lv no">✘</span>'; }
 
 function renderCard(p){
-  const roleCn = p.role==='oversea' ? '海外' : '国内';
+  const roleCn = {us:'美国',hk:'香港',domestic:'国内'}[p.role] || p.role;
   const dnsV = p.resolved ? `<span class="v dns">${p.resolved}</span> ${badge(true)}`
                           : `<span class="v fail">✘ 解析失败</span> ${badge(false)}`;
   const exitV = p.exit_ip ? `<span class="v ip">${p.exit_ip}</span> ${badge(true)}`
@@ -305,8 +293,9 @@ function renderCard(p){
       : (p.timeout ? `<div class="verdict timeout">⏱ 超时（探测超过硬上限，本次判失败）</div>`
                    : `<div class="verdict bad">══> 失败</div>`);
   const toBadge = p.timeout ? `<span class="tag timeout">⏱ 超时</span>` : '';
-  return `<div class="card ${p.role}${p.timeout ? ' timeout' : ''}">
-    <div class="card-head"><span class="domain">${p.domain}</span><span style="display:flex;gap:6px">${toBadge}<span class="tag ${p.role}">预期${roleCn}出口</span></span></div>
+  const roleColor = ({us:'var(--cyan)',hk:'var(--purple)',oversea:'var(--cyan)',domestic:'var(--yellow)'})[p.role]||'var(--dim)';
+  return `<div class="card" style="--card-accent:${roleColor}${p.timeout ? ';--card-accent:var(--yellow)' : ''}">
+    <div class="card-head"><span class="domain">${p.domain}</span><span style="display:flex;gap:6px">${toBadge}<span class="tag" style="background:color-mix(in srgb,${roleColor} 15%,transparent);color:${roleColor}">预期${roleCn}出口</span></span></div>
     <div class="row"><span class="k">${badge(!!p.resolved)} L1 解析</span><span>${dnsV}</span></div>
     <div class="row"><span class="k">${badge(!!p.exit_ip)} L2 出口</span><span>${exitV}</span></div>
     <div class="row"><span class="k">⏱ 延迟</span><span>${latV}</span></div>
@@ -437,15 +426,37 @@ function exitStop(){ clearInterval(exitTimer); clearInterval(exitCountTimer); $(
 function render(d){
   $('#ts').textContent='检测时间：'+d.ts;
   $('#dns').textContent=d.dns;
-  const ov=d.probes.filter(x=>x.role==='oversea'), dm=d.probes.filter(x=>x.role==='domestic');
-  $('#cards-oversea').innerHTML  = ov.length ? ov.map(renderCard).join('') : '<div style="color:var(--dim);font-size:12px;padding:8px">无海外探针</div>';
-  $('#cards-domestic').innerHTML = dm.length ? dm.map(renderCard).join('') : '<div style="color:var(--dim);font-size:12px;padding:8px">无国内探针</div>';
+  // 动态分组渲染(自适应两出口/三出口):按role分组,顺序、标签、颜色全部数据驱动
+  const ROLE_META = {
+    us:       {label:'美国出口（USPROXY · oversea.yaml）', color:'var(--cyan)'},
+    hk:       {label:'香港出口（HKPROXY · 兜底）', color:'var(--purple)'},
+    oversea:  {label:'海外出口（USPROXY）', color:'var(--cyan)'},
+    domestic: {label:'国内出口（DIRECT）', color:'var(--yellow)'},
+  };
+  const roles = [...new Set(d.probes.map(p=>p.role))];  // 保持API返回顺序
+  const container = $('#probe-groups');
+  container.innerHTML = roles.map((role,i)=>{
+    const meta = ROLE_META[role] || {label:role, color:'var(--dim)'};
+    const cards = d.probes.filter(x=>x.role===role).map(renderCard).join('');
+    return `<div class="probe-group" ${i>0?'style="margin-top:14px"':''}>
+      <div class="pg-label"><span class="pg-dot" style="background:${meta.color}"></span>${meta.label}</div>
+      <div class="grid">${cards}</div>
+    </div>`;
+  }).join('');
   const s=d.summary,b=$('#banner');
   if(s.all_ok){ b.className='banner ok'; b.innerHTML=`<span class="big">✔</span><span>全部通过 (${s.passed}/${s.total}) — 双出口分流与DNS解析均正常</span>`; }
   else { b.className='banner bad'; b.innerHTML=`<span class="big">✘</span><span>存在异常：通过 ${s.passed} / 失败 ${s.failed}（共${s.total}项）</span>`; }
   const sp=d.split;
-  $('#oip').textContent=sp.oversea_exit||'—';
-  $('#dip').textContent=sp.domestic_exit||'—';
+  // 分流校验:动态渲染各出口节点(适配两/三出口)
+  const SPLIT_META = {us:{lbl:'美国(USPROXY)',cls:'o'},hk:{lbl:'香港(HKPROXY)',cls:'o'},oversea:{lbl:'海外(USPROXY)',cls:'o'},domestic:{lbl:'国内(DIRECT)',cls:'d'}};
+  const exits = sp.exits || {};
+  const exitEntries = Object.entries(exits).filter(([_,ip])=>ip);
+  const splitNodes = $('#split-nodes');
+  splitNodes.innerHTML = exitEntries.map(([role,ip],i)=>{
+    const meta = SPLIT_META[role]||{lbl:role,cls:'o'};
+    const arrow = i < exitEntries.length-1 ? '<div class="arrow">⇄</div>' : '';
+    return `<div class="node ${meta.cls}"><div class="lbl">${meta.lbl}</div><div class="ip">${ip}</div></div>${arrow}`;
+  }).join('');
   const sv=$('#split-verdict');
   if(sp.ok===true){ sv.className='verdict-line ok'; sv.textContent='✔ '+sp.msg; }
   else if(sp.ok===false){ sv.className='verdict-line bad'; sv.textContent='✘ '+sp.msg; }
@@ -457,9 +468,13 @@ function render(d){
 function drawChart(hist){
   const box=$('#chart');
   if(!hist || hist.length<2){ box.innerHTML='<div class="hist-empty">暂无足够历史数据，多检测几次后显示趋势曲线</div>'; return; }
+  // 动态检测历史数据中有哪些 role 的延迟字段(适配两/三出口)
+  const ROLE_COLORS = {us:'#39c5cf',hk:'#bc8cff',oversea:'#39c5cf',domestic:'#d29922'};
+  const ROLE_LABELS = {us:'美国',hk:'香港',oversea:'海外',domestic:'国内'};
+  const latKeys = [...new Set(hist.flatMap(h=>Object.keys(h).filter(k=>k.endsWith('_latency') && h[k]!=null)))];
   const W=1040,H=220,pad={l:44,r:16,t:16,b:28};
   const iw=W-pad.l-pad.r, ih=H-pad.t-pad.b;
-  const lat=[]; hist.forEach(h=>{ if(h.oversea_latency!=null)lat.push(h.oversea_latency); if(h.domestic_latency!=null)lat.push(h.domestic_latency); });
+  const lat=[]; hist.forEach(h=>{ latKeys.forEach(k=>{ if(h[k]!=null)lat.push(h[k]); }); });
   const maxY=Math.max(100,...lat)*1.15, n=hist.length;
   const x=i=> pad.l + (n===1?0:iw*i/(n-1));
   const y=v=> pad.t + ih - ih*Math.min(v,maxY)/maxY;
@@ -467,26 +482,34 @@ function drawChart(hist){
     let dpath='',pts='';
     hist.forEach((h,i)=>{ const v=h[key]; if(v==null)return;
       dpath += (dpath===''?'M':'L')+x(i).toFixed(1)+' '+y(v).toFixed(1)+' ';
-      pts += `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.5" fill="${color}"/>`; });
+      pts += `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.5" fill="${color}"/>`;});
     return `<path d="${dpath}" fill="none" stroke="${color}" stroke-width="2"/>${pts}`;
   };
-  // Y 轴网格
   let grid='';
   for(let g=0;g<=4;g++){ const gy=pad.t+ih*g/4, val=Math.round(maxY*(4-g)/4);
     grid+=`<line x1="${pad.l}" y1="${gy}" x2="${W-pad.r}" y2="${gy}" stroke="#30363d" stroke-width="1" stroke-dasharray="3 3"/>`;
     grid+=`<text x="${pad.l-6}" y="${gy+4}" fill="#8b949e" font-size="10" text-anchor="end">${val}</text>`; }
-  // 底部状态点（分流/整体）
   let status='';
   hist.forEach((h,i)=>{ const ok=h.all_ok && h.split_ok!==false;
-    status+=`<circle cx="${x(i).toFixed(1)}" cy="${H-8}" r="3" fill="${ok?'#3fb950':'#f85149'}"/>`; });
-  // X 轴首末时间
+    status+=`<circle cx="${x(i).toFixed(1)}" cy="${H-8}" r="3" fill="${ok?'#3fb950':'#f85149'}"/>`;});
+  // 动态画各 role 的延迟曲线
+  const lines = latKeys.map(k=>{
+    const role = k.replace('_latency','');
+    return line(k, ROLE_COLORS[role]||'#8b949e');
+  }).join('');
   const t0=(hist[0].ts||'').slice(11,16), t1=(hist[n-1].ts||'').slice(11,16);
   box.innerHTML=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
-    ${grid}${line('oversea_latency','#39c5cf')}${line('domestic_latency','#d29922')}${status}
+    ${grid}${lines}${status}
     <text x="${pad.l}" y="${H-2}" fill="#8b949e" font-size="10">${t0}</text>
     <text x="${W-pad.r}" y="${H-2}" fill="#8b949e" font-size="10" text-anchor="end">${t1}</text>
     <text x="${W/2}" y="${H-2}" fill="#8b949e" font-size="10" text-anchor="middle">最近 ${n} 次 · 底部圆点=整体状态</text>
   </svg>`;
+  // 动态更新图例
+  const legendEl = box.parentElement.querySelector('.legend');
+  if(legendEl) legendEl.innerHTML = latKeys.map(k=>{
+    const role=k.replace('_latency','');
+    return `<span><i class="dot" style="background:${ROLE_COLORS[role]||'#8b949e'}"></i>${ROLE_LABELS[role]||role}延迟</span>`;
+  }).join('') + '<span><i class="dot" style="background:var(--green)"></i>正常</span><span><i class="dot" style="background:var(--red)"></i>异常</span>';
 }
 
 async function loadHistory(){

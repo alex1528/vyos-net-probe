@@ -16,6 +16,8 @@ Environment=PROBE_PORT=8899
 Environment=PROBE_DNS=127.0.0.1
 # 软链自愈检查间隔(秒)，0=关闭；防 VyOS commit/升级覆盖后本站点软链失效
 Environment=PROBE_SELF_HEAL_INTERVAL=300
+# mihomo 配置文件路径（探针启动时自动检测出口模式：有HKPROXY→三出口/仅USPROXY→两出口）
+Environment=MIHOMO_CONFIG_PATH=/etc/mihomo/config.yaml
 Restart=on-failure
 RestartSec=3
 # 安全加固（主服务仅需读+网络，无需写系统；ExecStartPre 用 '+' 豁免以管理 nginx）
