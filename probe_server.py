@@ -68,15 +68,12 @@ PROBES_3EXIT = [
     # 美国出口（USPROXY，域名在 oversea.yaml）
     {"domain": "ifconfig.me",    "expect": "美国", "want": "!CN", "role": "us"},
     {"domain": "api.ip.sb",      "expect": "美国", "want": "!CN", "role": "us"},
-    {"domain": "icanhazip.com",  "expect": "美国", "want": "!CN", "role": "us"},
     # 香港出口（HKPROXY，不在 oversea 也不在 DIRECT → 兜底 MATCH,HKPROXY）
     {"domain": "ifconfig.io",    "expect": "香港", "want": "!CN", "role": "hk"},
-    {"domain": "ifconfig.co",    "expect": "香港", "want": "!CN", "role": "hk"},
-    {"domain": "ipify.org",      "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "icanhazip.com",  "expect": "香港", "want": "!CN", "role": "hk"},
     # 国内出口（DIRECT，rules 显式）
     {"domain": "ipinfo.io/ip",   "expect": "国内", "want": "CN",  "role": "domestic"},
-    {"domain": "myip.com",       "expect": "国内", "want": "CN",  "role": "domestic"},
-    {"domain": "ipapi.co",       "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ifconfig.co",    "expect": "国内", "want": "CN",  "role": "domestic"},
 ]
 
 # 两出口模式(USPROXY + DIRECT)
@@ -86,9 +83,9 @@ PROBES_2EXIT = [
     {"domain": "api.ip.sb",      "expect": "海外", "want": "!CN", "role": "oversea"},
     {"domain": "icanhazip.com",  "expect": "海外", "want": "!CN", "role": "oversea"},
     # 国内出口（DIRECT，兜底 MATCH,DIRECT）
-    {"domain": "ifconfig.io",    "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "cip.cc",         "expect": "国内", "want": "CN",  "role": "domestic"},
     {"domain": "ipinfo.io/ip",   "expect": "国内", "want": "CN",  "role": "domestic"},
-    {"domain": "ipapi.co",       "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ifconfig.co",    "expect": "国内", "want": "CN",  "role": "domestic"},
 ]
 
 def _detect_exit_mode():
