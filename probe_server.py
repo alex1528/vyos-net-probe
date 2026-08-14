@@ -66,14 +66,17 @@ MIHOMO_CONFIG_PATH = os.environ.get("MIHOMO_CONFIG_PATH", "/etc/mihomo/config.ya
 
 PROBES_3EXIT = [
     # 美国出口（USPROXY，域名在 oversea.yaml）
-    {"domain": "ifconfig.me",    "expect": "美国", "want": "!CN", "role": "us"},
-    {"domain": "api.ip.sb",      "expect": "美国", "want": "!CN", "role": "us"},
-    # 香港出口（HKPROXY，不在 oversea 也不在 DIRECT → 兜底 MATCH,HKPROXY）
-    {"domain": "ifconfig.io",    "expect": "香港", "want": "!CN", "role": "hk"},
-    {"domain": "icanhazip.com",  "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "ifconfig.me",              "expect": "美国", "want": "!CN", "role": "us"},
+    {"domain": "api.ip.sb",                "expect": "美国", "want": "!CN", "role": "us"},
+    {"domain": "icanhazip.com",            "expect": "美国", "want": "!CN", "role": "us"},
+    # 香港出口（HKPROXY，rules 显式或兜底 MATCH,HKPROXY）
+    {"domain": "ifconfig.io",              "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "ipecho.net/plain",         "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "ident.me",                 "expect": "香港", "want": "!CN", "role": "hk"},
     # 国内出口（DIRECT，rules 显式）
-    {"domain": "ipinfo.io/ip",   "expect": "国内", "want": "CN",  "role": "domestic"},
-    {"domain": "ifconfig.co",    "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "cip.cc",                   "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ipinfo.io/ip",             "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ifconfig.co",              "expect": "国内", "want": "CN",  "role": "domestic"},
 ]
 
 # 两出口模式(USPROXY + DIRECT)
