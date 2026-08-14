@@ -485,19 +485,22 @@ def run_probes():
             passed += 1
         else:
             failed += 1
-    # L3 分流校验
-    split = {"oversea_exit": exits.get("oversea"), "domestic_exit": exits.get("domestic"),
-             "ok": None, "msg": ""}
-    if exits.get("oversea") and exits.get("domestic"):
-        if exits["oversea"] != exits["domestic"]:
+    # L3 分流校验(动态适配两/三出口:各出口IP互不相等=分流生效)
+    exit_ips = {role: ip for role, ip in exits.items() if ip}
+    split = {"exits": exit_ips, "ok": None, "msg": ""}
+    if len(exit_ips) >= 2:
+        unique_ips = set(exit_ips.values())
+        if len(unique_ips) == len(exit_ips):
             split["ok"] = True
-            split["msg"] = "分流生效：海外/国内出口IP不同，走了不同线路"
+            labels = " / ".join(f"{r}={ip}" for r, ip in exit_ips.items())
+            split["msg"] = f"分流生效：{len(exit_ips)} 个出口IP互不相同（{labels}）"
         else:
             split["ok"] = False
-            split["msg"] = "分流未生效：两出口IP相同，oversea.yaml 分流可能未命中"
+            labels = " / ".join(f"{r}={ip}" for r, ip in exit_ips.items())
+            split["msg"] = f"分流异常：存在相同出口IP（{labels}），检查规则/oversea.yaml"
             failed += 1
     else:
-        split["msg"] = "跳过（有探针未取到出口IP，无法对比）"
+        split["msg"] = f"跳过（仅取到 {len(exit_ips)} 个出口IP，不足对比）"
     pptp = pptp_status()
     total = passed + failed
     data = {
