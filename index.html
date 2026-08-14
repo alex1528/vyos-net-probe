@@ -444,7 +444,7 @@ function render(d){
     </div>`;
   }).join('');
   const s=d.summary,b=$('#banner');
-  if(s.all_ok){ b.className='banner ok'; b.innerHTML=`<span class="big">✔</span><span>全部通过 (${s.passed}/${s.total}) — 双出口分流与DNS解析均正常</span>`; }
+  if(s.all_ok){ b.className='banner ok'; b.innerHTML=`<span class="big">✔</span><span>全部通过 (${s.passed}/${s.total}) — 出口分流与DNS解析均正常</span>`; }
   else { b.className='banner bad'; b.innerHTML=`<span class="big">✘</span><span>存在异常：通过 ${s.passed} / 失败 ${s.failed}（共${s.total}项）</span>`; }
   const sp=d.split;
   // 分流校验:动态渲染各出口节点(适配两/三出口)
