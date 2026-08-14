@@ -1,6 +1,6 @@
 # 出口分流监控看板
 
-在 VyOS 网关上监控出口分流（海外/国内）与 PPTP/GRE 隧道状态的**浏览器可视化看板**：集 DNS 解析、双出口探测、归属地查询、分流校验于一体，通过 nginx 反代对外提供。
+在 VyOS 网关上监控出口分流与 PPTP/GRE 隧道状态的**浏览器可视化看板**：集 DNS 解析、多出口探测（自动适配两出口/三出口）、归属地查询、分流校验于一体，通过 nginx 反代对外提供。
 
 ## 快速开始
 
@@ -81,7 +81,7 @@ sudo bash /tmp/vyos-net-probe/deploy.sh
 |------|------|
 | **去 dig 依赖** | L1 解析改用纯 Python `socket` 构造 DNS 查询包直接问本地代理 DNS(53)，不再依赖 `dig`/`bind9-dnsutils` |
 | **PPTP/GRE 状态** | 读 `/proc/net/nf_conntrack`（无需 `conntrack` 命令）统计 GRE replied/unreplied 与 TCP 1723，判定隧道是否打通 |
-| **探针（各3个·全纯IP）** | 海外 ifconfig.me / api.ip.sb / icanhazip.com；国内 ifconfig.io / ip.3322.net / ipinfo.io/ip —— 均返回纯 IP，L2 提取零歧义，避免 JSON/中文文本域名导致误判 |
+| **探针（自动适配·全纯IP）** | 自动检测 mihomo 配置切换两出口/三出口模式。三出口：美国(ifconfig.me/api.ip.sb/icanhazip.com) + 香港(ifconfig.io/ipecho.net/ident.me) + 国内(cip.cc/ipinfo.io/ip/ifconfig.co)；两出口：海外3+国内3 |
 | **历史趋势** | 每次探测落盘 `history.jsonl`（**按时间保留最近 7 天**，自动滚动清理），`/api/history` + 前端纯 SVG 折线图展示海外/国内出口延迟与整体状态时间线 |
 
 ### PPTP/GRE 判定逻辑
@@ -110,17 +110,23 @@ sudo bash /tmp/vyos-net-probe/deploy.sh
 编辑 `probe_server.py` 顶部 `PROBES` 列表增减探测域名：
 
 ```python
-PROBES = [
-    # 海外各3个（应走 USPROXY，返回海外出口 IP）
-    {"domain": "ifconfig.me",   "expect": "海外", "want": "!CN", "role": "oversea"},
-    {"domain": "api.ip.sb",     "expect": "海外", "want": "!CN", "role": "oversea"},
-    {"domain": "icanhazip.com", "expect": "海外", "want": "!CN", "role": "oversea"},
-    # 国内各3个（应走 DIRECT，返回国内出口 IP）
-    {"domain": "ifconfig.io",   "expect": "国内", "want": "CN",  "role": "domestic"},
-    {"domain": "ip.3322.net",   "expect": "国内", "want": "CN",  "role": "domestic"},
-    {"domain": "ipinfo.io/ip",  "expect": "国内", "want": "CN",  "role": "domestic"},
+# 三出口模式(自动检测 mihomo 配置含 HKPROXY 时启用)
+PROBES_3EXIT = [
+    # 美国出口(USPROXY，域名在 oversea.yaml)
+    {"domain": "ifconfig.me",      "expect": "美国", "want": "!CN", "role": "us"},
+    {"domain": "api.ip.sb",        "expect": "美国", "want": "!CN", "role": "us"},
+    {"domain": "icanhazip.com",    "expect": "美国", "want": "!CN", "role": "us"},
+    # 香港出口(HKPROXY，不在 oversea → 兜底)
+    {"domain": "ifconfig.io",      "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "ipecho.net/plain", "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "ident.me",         "expect": "香港", "want": "!CN", "role": "hk"},
+    # 国内出口(DIRECT，rules 显式)
+    {"domain": "cip.cc",           "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ipinfo.io/ip",     "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ifconfig.co",      "expect": "国内", "want": "CN",  "role": "domestic"},
 ]
-# ⚠️ 选域名原则：优先返回【纯IP】的服务，避免JSON(ipinfo.io)/中文文本(myip.ipip.net)导致L2提取或判定偏差
+# ⚠️ 选域名原则：优先返回【纯IP】的服务，避免JSON/中文文本导致L2提取偏差
+# 启动时自动检测 mihomo 配置(MIHOMO_CONFIG_PATH)决定两出口/三出口模式
 ```
 
 改后 `sudo systemctl restart probe`。

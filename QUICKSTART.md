@@ -1,6 +1,6 @@
 # vyos-net-probe 快速开始
 
-> 出口分流监控探针 —— 在 VyOS 网关上监控出口分流（海外/国内）与 PPTP/GRE 隧道状态的可视化看板。
+> 出口分流监控探针 —— 在 VyOS 网关上监控出口分流（自动适配两出口/三出口）与 PPTP/GRE 隧道状态的可视化看板。
 
 ## 一图速览
 
@@ -8,7 +8,7 @@
 浏览器 ──HTTP:8080──> nginx(VyOS 独立站点 /) ──反代──> probe_server.py (127.0.0.1:8899)
                                                       ├ L1 DNS 解析（socket 直连本地代理 DNS）
                                                       ├ L2 出口探测（curl 各探针取出口 IP + 延迟）
-                                                      ├ L3 分流校验（海外≠国内出口 IP）
+                                                      ├ L3 分流校验（各出口IP互不相等=分流生效，动态适配两/三出口）
                                                       ├ L4 归属地（ip-api/百度/ipinfo.io 三源）
                                                       └ PPTP/GRE（读 /proc/net/nf_conntrack）
 ```
@@ -86,13 +86,17 @@ journalctl -u probe -f          # 实时日志
 ```python
 PROBES = [
     # 海外（应走 USPROXY，返回海外出口 IP）
-    {"domain": "ifconfig.me",   "expect": "海外", "want": "!CN", "role": "oversea"},
-    {"domain": "api.ip.sb",     "expect": "海外", "want": "!CN", "role": "oversea"},
-    {"domain": "icanhazip.com", "expect": "海外", "want": "!CN", "role": "oversea"},
-    # 国内（应走 DIRECT，返回国内出口 IP）
-    {"domain": "ifconfig.io",   "expect": "国内", "want": "CN",  "role": "domestic"},
-    {"domain": "ip.3322.net",   "expect": "国内", "want": "CN",  "role": "domestic"},
-    {"domain": "ipinfo.io/ip",  "expect": "国内", "want": "CN",  "role": "domestic"},
+    # 三出口示例(自动检测 mihomo 配置)
+    # 美国(USPROXY) / 香港(HKPROXY兜底) / 国内(DIRECT)
+    {"domain": "ifconfig.me",      "expect": "美国", "want": "!CN", "role": "us"},
+    {"domain": "api.ip.sb",        "expect": "美国", "want": "!CN", "role": "us"},
+    {"domain": "icanhazip.com",    "expect": "美国", "want": "!CN", "role": "us"},
+    {"domain": "ifconfig.io",      "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "ipecho.net/plain", "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "ident.me",         "expect": "香港", "want": "!CN", "role": "hk"},
+    {"domain": "cip.cc",           "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ipinfo.io/ip",     "expect": "国内", "want": "CN",  "role": "domestic"},
+    {"domain": "ifconfig.co",      "expect": "国内", "want": "CN",  "role": "domestic"},
 ]
 ```
 
