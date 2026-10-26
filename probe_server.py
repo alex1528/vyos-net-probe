@@ -42,6 +42,10 @@ LISTEN_HOST = os.environ.get("PROBE_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("PROBE_PORT", "8899"))
 CURL_TIMEOUT = 8
 PROBE_HARD_TIMEOUT = 25   # 单探针(L1+L2+L4)整体硬超时上限(秒)，超时判失败但不阻塞整体
+# L1 DNS 解析调优（新增）：超时/重试/是否补查 AAAA，均可用环境变量覆盖
+DNS_TIMEOUT    = float(os.environ.get("PROBE_DNS_TIMEOUT", "3"))   # 单次 DNS 查询超时(秒)
+DNS_RETRIES    = int(os.environ.get("PROBE_DNS_RETRIES", "2"))     # UDP 丢包重试次数
+DNS_QUERY_AAAA = os.environ.get("PROBE_DNS_AAAA", "1") not in ("0", "false", "False", "")  # A 无结果时补查 AAAA
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE = os.path.join(BASE_DIR, "history.jsonl")
 PPTP_HISTORY_FILE = os.path.join(BASE_DIR, "pptp_history.jsonl")
@@ -129,67 +133,175 @@ IPV4_RE = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 IPV4_FULL = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 
 # =====================================================================
-# L1：纯 socket DNS 查询（替代 dig，零外部依赖）
+# L1：纯 socket DNS 解析（替代 dig，零外部依赖）—— v2.1 加固版
+#   改进：TID+来源校验、RCODE 判别(NXDOMAIN/SERVFAIL/REFUSED)、
+#        丢包重试、TC 截断回退 TCP、A 无结果补查 AAAA、记录解析耗时。
 # =====================================================================
-def dns_query_a(domain, server=DNS_SERVER, port=53, timeout=3):
-    """向指定 DNS 服务器发 A 记录查询，返回首个 IPv4 或 None。"""
+_DNS_RCODE = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL",
+              3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
+
+def _dns_build_query(domain, qtype):
+    """构造 DNS 查询报文，返回 (tid, packet_bytes)。"""
     tid = random.randint(0, 0xffff)
     header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)  # RD=1
     q = b""
     for part in domain.split("."):
         if not part:
             continue
-        q += bytes([len(part)]) + part.encode("ascii", "ignore")
-    q += b"\x00" + struct.pack(">HH", 1, 1)  # QTYPE=A, QCLASS=IN
-    packet = header + q
-    s = None
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-        s.sendto(packet, (server, port))
-        data, _ = s.recvfrom(4096)
-    except Exception:
-        return None
-    finally:
-        if s:
-            s.close()
+        label = part.encode("ascii", "ignore")[:63]
+        q += bytes([len(label)]) + label
+    q += b"\x00" + struct.pack(">HH", qtype, 1)  # QTYPE, QCLASS=IN
+    return tid, header + q
+
+def _dns_skip_name(data, idx):
+    """跳过一个(可能被压缩的)域名，返回新偏移。"""
+    while idx < len(data):
+        length = data[idx]
+        if length == 0:
+            return idx + 1
+        if length & 0xc0 == 0xc0:      # 压缩指针占 2 字节
+            return idx + 2
+        idx += length + 1
+    return idx
+
+def _dns_parse_answer(data, qtype):
+    """从响应报文解析首个匹配 qtype 的地址字符串，无则 None。"""
     if len(data) < 12:
         return None
     ancount = struct.unpack(">H", data[6:8])[0]
     if ancount == 0:
         return None
-    idx = 12
-    # 跳过 question 的 QNAME
-    try:
-        while idx < len(data):
-            length = data[idx]
-            if length == 0:
-                idx += 1
-                break
-            if length & 0xc0 == 0xc0:
-                idx += 2
-                break
-            idx += length + 1
-        idx += 4  # QTYPE + QCLASS
-        for _ in range(ancount):
-            if idx + 2 > len(data):
-                break
-            if data[idx] & 0xc0 == 0xc0:
-                idx += 2
-            else:
-                while idx < len(data) and data[idx] != 0:
-                    idx += data[idx] + 1
-                idx += 1
-            if idx + 10 > len(data):
-                break
-            rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", data[idx:idx+10])
-            idx += 10
-            if rtype == 1 and rdlen == 4:
+    idx = _dns_skip_name(data, 12)   # 跳过 question 的 QNAME(QDCOUNT 固定 1)
+    idx += 4                          # QTYPE + QCLASS
+    for _ in range(ancount):
+        if idx >= len(data):
+            break
+        idx = _dns_skip_name(data, idx)
+        if idx + 10 > len(data):
+            break
+        rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", data[idx:idx+10])
+        idx += 10
+        if idx + rdlen > len(data):
+            break
+        if rtype == qtype:
+            if qtype == 1 and rdlen == 4:
                 return ".".join(str(b) for b in data[idx:idx+4])
-            idx += rdlen
-    except Exception:
-        return None
+            if qtype == 28 and rdlen == 16:
+                try:
+                    return socket.inet_ntop(socket.AF_INET6, data[idx:idx+16])
+                except Exception:
+                    return None
+        idx += rdlen
     return None
+
+def _dns_query_udp(packet, tid, qtype, server, port, timeout):
+    """发一次 UDP 查询。返回 (rcode|None, addr|None, tc)。rcode=None=网络层失败。"""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(packet, (server, port))
+        deadline = time.time() + timeout
+        while True:
+            data, srcaddr = s.recvfrom(4096)
+            if srcaddr[0] != server:                              # 来源地址校验
+                if time.time() >= deadline:
+                    return None, None, False
+                continue
+            if len(data) < 4 or data[:2] != struct.pack(">H", tid):  # TID 校验
+                if time.time() >= deadline:
+                    return None, None, False
+                continue
+            flags = struct.unpack(">H", data[2:4])[0]
+            rcode = flags & 0x0F
+            tc = bool(flags & 0x0200)
+            addr = _dns_parse_answer(data, qtype) if rcode == 0 else None
+            return rcode, addr, tc
+    except socket.timeout:
+        return None, None, False
+    except Exception:
+        return None, None, False
+    finally:
+        if s:
+            s.close()
+
+def _dns_query_tcp(packet, tid, qtype, server, port, timeout):
+    """TC=1 截断时回退 TCP/53 重查。返回 (rcode|None, addr|None)。"""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((server, port))
+        s.sendall(struct.pack(">H", len(packet)) + packet)   # TCP 前置 2 字节长度
+        ln = s.recv(2)
+        if len(ln) < 2:
+            return None, None
+        resp_len = struct.unpack(">H", ln)[0]
+        buf = b""
+        while len(buf) < resp_len:
+            chunk = s.recv(resp_len - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        if len(buf) < 4 or buf[:2] != struct.pack(">H", tid):
+            return None, None
+        flags = struct.unpack(">H", buf[2:4])[0]
+        rcode = flags & 0x0F
+        addr = _dns_parse_answer(buf, qtype) if rcode == 0 else None
+        return rcode, addr
+    except Exception:
+        return None, None
+    finally:
+        if s:
+            s.close()
+
+def _dns_resolve_qtype(host, qtype, server, port, timeout, retries):
+    """解析单一记录类型，含丢包重试与 TC→TCP 回退。返回 (rcode|None, addr|None)。"""
+    last_rcode = None
+    for _ in range(max(1, retries)):
+        tid, packet = _dns_build_query(host, qtype)
+        rcode, addr, tc = _dns_query_udp(packet, tid, qtype, server, port, timeout)
+        if tc:                                   # 截断 → TCP 重查
+            rcode, addr = _dns_query_tcp(packet, tid, qtype, server, port, timeout)
+        if rcode is not None:                    # 拿到明确响应(含 NXDOMAIN 等)即返回
+            return rcode, addr
+        last_rcode = rcode                       # 仍为网络失败，继续重试
+    return last_rcode, None
+
+def dns_resolve(host, server=DNS_SERVER, port=53, timeout=None, retries=None, want_aaaa=None):
+    """结构化 DNS 解析（L1 核心）。返回:
+       {ok, ip, ipv6, rcode, rtt_ms, error}
+       - ok: 是否拿到 A 或 AAAA 地址
+       - rcode: 文本化应答码(NOERROR/NXDOMAIN/SERVFAIL/REFUSED/...)，网络失败为 None
+       - error: 失败归因(no_response=超时/不可达；其余为 rcode 文本)
+    """
+    timeout = DNS_TIMEOUT if timeout is None else timeout
+    retries = DNS_RETRIES if retries is None else retries
+    want_aaaa = DNS_QUERY_AAAA if want_aaaa is None else want_aaaa
+    out = {"ok": False, "ip": None, "ipv6": None,
+           "rcode": None, "rtt_ms": None, "error": None}
+    t0 = time.time()
+    rcode_a, ip = _dns_resolve_qtype(host, 1, server, port, timeout, retries)
+    out["ip"] = ip
+    out["rcode"] = _DNS_RCODE.get(rcode_a, rcode_a) if rcode_a is not None else None
+    if want_aaaa and not ip:
+        rcode_6, ip6 = _dns_resolve_qtype(host, 28, server, port, timeout, retries)
+        out["ipv6"] = ip6
+        if ip6 and rcode_a is None:
+            out["rcode"] = _DNS_RCODE.get(rcode_6, rcode_6)
+    out["rtt_ms"] = int((time.time() - t0) * 1000)
+    if out["ip"] or out["ipv6"]:
+        out["ok"] = True
+    elif rcode_a is None:
+        out["error"] = "no_response"       # 超时/无响应/本地 DNS 不可达
+    else:
+        out["error"] = out["rcode"]        # NXDOMAIN / SERVFAIL / REFUSED / NOERROR(无A)
+    return out
+
+def dns_query_a(domain, server=DNS_SERVER, port=53, timeout=None):
+    """向后兼容包装：仅返回首个 IPv4（或 None）。内部走结构化 dns_resolve。"""
+    return dns_resolve(domain, server=server, port=port,
+                       timeout=timeout, want_aaaa=False)["ip"]
 
 def sh(cmd, timeout):
     """执行外部命令，返回 (rc, stdout_stripped)。"""
@@ -425,13 +537,18 @@ def _probe_one(pcfg):
     """单个探针的完整检测(L1解析 + L2出口 + L4归属地)。供并行调用。"""
     domain, expect, want, role = pcfg["domain"], pcfg["expect"], pcfg["want"], pcfg["role"]
     item = {"domain": domain, "expect": expect, "role": role,
-            "resolved": None, "exit_ip": None, "latency": None,
+            "resolved": None, "dns_rcode": None, "dns_rtt": None, "dns_error": None,
+            "exit_ip": None, "latency": None,
             "cc": None, "country": None, "geo_ok": None, "ok": True,
             "levels": {}}
     # L1: domain 可能带路径(如 ipinfo.io/ip)——DNS 解析只取主机名部分
     host = domain.split("/")[0]
-    resolved = dns_query_a(host)
+    dnsr = dns_resolve(host)
+    resolved = dnsr["ip"] or dnsr["ipv6"]     # A 优先，回退 AAAA
     item["resolved"] = resolved
+    item["dns_rcode"] = dnsr["rcode"]          # 失败归因:NXDOMAIN/SERVFAIL/REFUSED/...
+    item["dns_rtt"]   = dnsr["rtt_ms"]         # DNS 解析耗时(ms)，可作慢速早期告警
+    item["dns_error"] = dnsr["error"]
     item["levels"]["L1"] = bool(resolved)
     if not resolved:
         item["ok"] = False
@@ -460,23 +577,38 @@ def run_probes():
     # 并行执行所有探针(每个探针含 curl 出口 + 归属地，串行累加会超 nginx 超时)
     # 并发后总耗时 ≈ 最慢的单个探针，而非所有探针之和；
     # 并对每个探针设硬超时上限(PROBE_HARD_TIMEOUT)，任一探针卡死不阻塞整体返回。
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import TimeoutError as _FutTimeout
 
     def _timeout_item(pcfg):
         # 探针整体超时时的兜底结果(视为该探针失败)
         return {"domain": pcfg["domain"], "expect": pcfg["expect"], "role": pcfg["role"],
-                "resolved": None, "exit_ip": None, "latency": None,
+                "resolved": None, "dns_rcode": None, "dns_rtt": None, "dns_error": "timeout",
+                "exit_ip": None, "latency": None,
                 "cc": None, "country": None, "geo_ok": None, "ok": False,
                 "levels": {"L1": False, "L2": False}, "timeout": True}
     results = [None] * len(PROBES)
-    with ThreadPoolExecutor(max_workers=min(8, len(PROBES) or 1)) as ex:
+    # 并发缺陷修复：原先用 `with ThreadPoolExecutor() as ex:`，退出时 shutdown(wait=True)
+    #   会阻塞等待卡死线程真正结束；改为显式 try/finally + shutdown(wait=False)，
+    #   并用 as_completed 设“整批”硬上限(PROBE_HARD_TIMEOUT)，任何未完成的槽位统一兜底。
+    ex = ThreadPoolExecutor(max_workers=min(8, len(PROBES) or 1))
+    try:
         futs = {ex.submit(_probe_one, pc): idx for idx, pc in enumerate(PROBES)}
-        for fut, idx in futs.items():
-            try:
-                results[idx] = fut.result(timeout=PROBE_HARD_TIMEOUT)
-            except Exception:
-                # 单探针超时/异常 → 兜底为失败项，不影响其他探针与整体返回
+        try:
+            for fut in as_completed(futs, timeout=PROBE_HARD_TIMEOUT):
+                idx = futs[fut]
+                try:
+                    results[idx] = fut.result()
+                except Exception:
+                    results[idx] = _timeout_item(PROBES[idx])
+        except _FutTimeout:
+            # 整批超过硬上限：已完成的保留，未完成的在下方统一兜底
+            pass
+        for idx, item in enumerate(results):
+            if item is None:
                 results[idx] = _timeout_item(PROBES[idx])
+    finally:
+        ex.shutdown(wait=False)   # 不等卡死线程，避免被退出处阻塞整体返回
     # 汇总(保持 PROBES 原始顺序，ex.map 有序返回)
     for item in results:
         if item["exit_ip"]:

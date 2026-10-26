@@ -278,8 +278,13 @@ function badge(ok){ return ok ? '<span class="lv ok">✔</span>' : '<span class=
 
 function renderCard(p){
   const roleCn = {us:'美国',hk:'香港',domestic:'国内'}[p.role] || p.role;
-  const dnsV = p.resolved ? `<span class="v dns">${p.resolved}</span> ${badge(true)}`
-                          : `<span class="v fail">✘ 解析失败</span> ${badge(false)}`;
+  // L1 解析失败文案：优先显示结构化归因(dns_rcode/dns_error)，回退到笼统"解析失败"
+  const _rcodeCn = {NXDOMAIN:'域名不存在',SERVFAIL:'DNS服务故障',REFUSED:'被拒绝',NOERROR:'无A记录'};
+  const dnsFail = p.dns_error==='no_response' ? '✘ 无响应/超时'
+                : (p.dns_rcode ? ('✘ ' + (_rcodeCn[p.dns_rcode] || p.dns_rcode)) : '✘ 解析失败');
+  const dnsRtt = (p.dns_rtt!=null) ? ` <span class="v dimv">(${p.dns_rtt}ms)</span>` : '';
+  const dnsV = p.resolved ? `<span class="v dns">${p.resolved}</span> ${badge(true)}${dnsRtt}`
+                          : `<span class="v fail">${dnsFail}</span> ${badge(false)}${dnsRtt}`;
   const exitV = p.exit_ip ? `<span class="v ip">${p.exit_ip}</span> ${badge(true)}`
                           : `<span class="v fail">✘ 无响应</span> ${badge(false)}`;
   const latV = (p.latency!=null) ? `<span class="v lat">${p.latency} ms</span>` : `<span class="v dimv">—</span>`;
