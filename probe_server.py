@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 =====================================================================
- 出口分流探针后端服务  (probe_server.py)  v2.3
+ 出口分流探针后端服务  (probe_server.py)  v2.4
 =====================================================================
  功能：
    - L1 DNS 解析：纯 socket 构造 DNS 查询包问本地代理 DNS（零 dig 依赖，等价 dig @IP；
      默认自动取 eth2/eth3 网卡 IP 作为 DNS 服务器，可用 PROBE_DNS 指定）
-   - L2 出口探测：curl 取出口 IP + 测量延迟
-   - L4 归属地：多源冗余查询；按出口通道(DIRECT/HKPROXY/USPROXY)配置预期归属地，
+   - L2 出口探测：curl -4 取出口 IP；默认用 L1 解析结果 --resolve 直连(与 L1 同一台 DNS)，
+     记录 DNS/建连/总耗时与 HTTP 状态码，失败时按 curl 退出码给出具体原因
+   - L4 归属地：多源冗余查询(总预算 PROBE_GEO_BUDGET 秒)，按出口 IP 缓存(PROBE_GEO_CACHE_TTL)，失败时逐源给出原因；按出口通道配置预期归属地，
      不一致默认仅提示（PROBE_GEO_STRICT=1 可改为判失败）
    - 串线检测：某通道出口 IP 与其他通道相同 → 判失败（规则没命中、掉进兜底等）
    - L3 分流校验：海外出口 IP ≠ 国内出口 IP
@@ -53,6 +54,18 @@ DNS_SERVER  = "127.0.0.1"   # 兜底值（兼容旧引用）；实际以 select_
 LISTEN_HOST = os.environ.get("PROBE_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("PROBE_PORT", "8899"))
 CURL_TIMEOUT = 8
+# L2 出口探测（v2.4）：域名解析来源
+#   l1(默认)  → 用 L1 解析出的 IPv4 做 `curl --resolve host:80:IP`，与 L1 同一台 DNS；L1 失败时回退系统 DNS
+#   system    → 不加 --resolve，走系统 DNS(/etc/resolv.conf)，即 v2.3 及以前行为
+L2_RESOLVE = os.environ.get("PROBE_L2_RESOLVE", "l1").strip().lower() or "l1"
+# L4 归属地查询总预算(秒，v2.4)：多源依次尝试，剩余时间不足 1s 则跳过后续源。
+#   默认 10s，保证 L1(≤6s)+L2(≤8s)+L4 不超过 PROBE_HARD_TIMEOUT，失败原因才能完整回传
+GEO_BUDGET = float(os.environ.get("PROBE_GEO_BUDGET", "10"))
+# L4 归属地缓存(v2.4)：按 (出口IP, 源顺序) 缓存成功结果 PROBE_GEO_CACHE_TTL 秒(默认 3600，0=关闭)。
+#   出口 IP 变化时键随之变化，自动重新查询；失败结果不缓存，下一轮重试。
+#   同一轮内多个探针同一出口 IP 只查一次(并发去重)，其余探针等待复用。
+GEO_CACHE_TTL = int(os.environ.get("PROBE_GEO_CACHE_TTL", "3600"))
+GEO_CACHE_MAX = 256
 PROBE_HARD_TIMEOUT = 25   # 单探针(L1+L2+L4)整体硬超时上限(秒)，超时判失败但不阻塞整体
 # L1 DNS 解析调优（新增）：超时/重试/是否补查 AAAA，均可用环境变量覆盖
 DNS_TIMEOUT    = float(os.environ.get("PROBE_DNS_TIMEOUT", "3"))   # 单次 DNS 查询超时(秒)
@@ -439,16 +452,82 @@ def sh(cmd, timeout):
 # =====================================================================
 # L2：出口 IP 探测 + 延迟
 # =====================================================================
-def get_exit_ip(domain):
-    """curl 域名取出口 IP，返回 (ip 或 None, 延迟ms 或 None)。"""
-    t0 = time.time()
-    rc, out = sh(["curl", "-s", "--max-time", str(CURL_TIMEOUT), domain], CURL_TIMEOUT + 2)
-    latency = int((time.time() - t0) * 1000)
-    # 出口探测服务可能返回纯IP或含IP的文本，提取首个IPv4
-    m = IPV4_RE.search(out or "")
-    if m:
-        return m.group(0), latency
+# curl 退出码 → 失败原因（只列常见项，其余显示原码）
+CURL_ERR = {
+    5: "代理地址解析失败", 6: "域名解析失败", 7: "连接失败(拒绝/不可达)",
+    18: "响应不完整", 28: "超时", 35: "TLS 握手失败", 47: "跳转过多",
+    52: "服务器空响应", 55: "发送失败", 56: "接收失败(连接被重置)",
+}
+_L2_MARK = "\n__L2_METRICS__"
+
+def _curl_fail_reason(rc, http_code, body_has_ip):
+    """按 curl 退出码 / HTTP 状态码 / 返回内容归纳失败原因。返回 (code, 中文)。"""
+    if rc == -1:
+        return "exec", "curl 执行失败(未安装或被强制终止)"
+    if rc not in (0, None):
+        return f"curl_{rc}", CURL_ERR.get(rc, f"curl 错误 {rc}")
+    if http_code and 300 <= http_code < 400:
+        return f"http_{http_code}", f"HTTP {http_code} 跳转(探针不跟随跳转)"
+    if http_code and http_code >= 400:
+        return f"http_{http_code}", f"HTTP {http_code}"
+    if http_code == 0:
+        return "no_http", "无 HTTP 响应"
+    if not body_has_ip:
+        return "no_ip", "返回内容中无 IPv4"
     return None, None
+
+def build_l2_cmd(domain, resolve_ip=None, timeout=None):
+    """生成 L2 的 curl 命令（列表形式）。resolve_ip 存在时加 --resolve，与 L1 用同一解析结果。"""
+    timeout = CURL_TIMEOUT if timeout is None else timeout
+    host = domain.split("/")[0]
+    cmd = ["curl", "-4", "-s", "--max-time", str(timeout),
+           "-w", _L2_MARK + "%{http_code} %{time_namelookup} %{time_connect} %{time_total} %{remote_ip}"]
+    if resolve_ip:
+        cmd += ["--resolve", f"{host}:80:{resolve_ip}"]
+    cmd.append("http://" + domain)
+    return cmd
+
+def l2_probe(domain, resolve_ip=None):
+    """L2：curl 取出口 IP。返回结构化结果：
+       {ip, latency, via, resolve_ip, http_code, t_dns_ms, t_connect_ms, t_total_ms,
+        remote_ip, curl_rc, error, error_cn}
+       latency 优先取 curl 自身 time_total（不含进程启动开销），取不到再用墙钟耗时。"""
+    via = "l1" if resolve_ip else "system"
+    cmd = build_l2_cmd(domain, resolve_ip)
+    t0 = time.time()
+    rc, out = sh(cmd, CURL_TIMEOUT + 2)
+    wall = int((time.time() - t0) * 1000)
+    body, metrics = (out or ""), ""
+    if _L2_MARK.strip() in body:
+        body, metrics = body.rsplit(_L2_MARK.strip(), 1)
+    http_code = t_dns = t_conn = t_total = None
+    remote_ip = None
+    parts = metrics.split()
+    try:
+        if len(parts) >= 4:
+            http_code = int(parts[0])
+            t_dns = int(float(parts[1]) * 1000)
+            t_conn = int(float(parts[2]) * 1000)
+            t_total = int(float(parts[3]) * 1000)
+            remote_ip = parts[4] if len(parts) >= 5 else None
+    except ValueError:
+        pass
+    m = IPV4_RE.search(body)
+    err, err_cn = _curl_fail_reason(rc, http_code, bool(m))
+    res = {"ip": None, "latency": None, "via": via, "resolve_ip": resolve_ip,
+           "http_code": http_code, "t_dns_ms": t_dns, "t_connect_ms": t_conn,
+           "t_total_ms": t_total, "remote_ip": remote_ip or None, "curl_rc": rc,
+           "error": err, "error_cn": err_cn}
+    if err is None and m:
+        res["ip"] = m.group(0)
+        res["latency"] = t_total if t_total is not None else wall
+    return res
+
+def get_exit_ip(domain, resolve_ip=None):
+    """向后兼容包装：返回 (ip 或 None, 延迟ms 或 None)。"""
+    r = l2_probe(domain, resolve_ip)
+    return r["ip"], r["latency"]
+
 # =====================================================================
 # L4：归属地查询（多源冗余，走国内直连）
 # =====================================================================
@@ -463,58 +542,163 @@ CC_ZH = {
     "AE": "阿联酋", "ZA": "南非", "MX": "墨西哥", "PL": "波兰", "UA": "乌克兰",
 }
 
-def _geo_ipapi(ip):
-    """ip-api.com（国内直连快，带中文国名）→ (cc, 中文名) 或 None。"""
-    rc, out = sh(["curl", "-s", "--max-time", "5",
-                  f"http://ip-api.com/json/{ip}?fields=status,countryCode,country&lang=zh-CN"], 7)
-    if out and '"status":"success"' in out:
-        try:
-            d = json.loads(out)
-            return d.get("countryCode"), d.get("country")
-        except Exception:
-            pass
-    return None
+_GEO_MARK = "__GEO_METRICS__"
 
-def _geo_baidu(ip):
-    """百度企服（国内兜底）→ (cc, 中文名) 或 None。"""
-    rc, out = sh(["curl", "-s", "--max-time", "5",
-                  f"https://qifu-api.baidubce.com/ip/geo/v1/district?ip={ip}"], 7)
-    if out:
-        m = re.search(r'"country":"([^"]*)"', out)
-        if m:
-            country = m.group(1)
-            return ("CN" if country == "中国" else "XX"), country
-    return None
-
-def _geo_ipinfo(ip):
-    """ipinfo.io 公开接口（对海外 IP 判定权威）→ (cc, 中文名) 或 None。country 为两字母码。"""
-    rc, out = sh(["curl", "-s", "--max-time", "6", f"https://ipinfo.io/{ip}/json"], 8)
-    if out:
+def _curl_get(url, max_time):
+    """通用 HTTP GET（L4 用）：返回 {body, http_code, ms, rc, error, error_cn}。"""
+    cmd = ["curl", "-4", "-s", "--max-time", str(max_time),
+           "-w", "\n" + _GEO_MARK + "%{http_code} %{time_total}", url]
+    t0 = time.time()
+    rc, out = sh(cmd, max_time + 2)
+    wall = int((time.time() - t0) * 1000)
+    body, http_code, ms = (out or ""), None, wall
+    if _GEO_MARK in body:
+        body, metrics = body.rsplit(_GEO_MARK, 1)
+        parts = metrics.split()
         try:
-            d = json.loads(out)
-            cc = d.get("country")
-            if cc:
-                return cc, CC_ZH.get(cc, cc)  # 无映射则回退显示国码本身
-        except Exception:
+            http_code = int(parts[0])
+            ms = int(float(parts[1]) * 1000)
+        except (IndexError, ValueError):
             pass
-    return None
+    err, err_cn = _curl_fail_reason(rc, http_code, True)
+    if http_code == 429:
+        err, err_cn = "http_429", "HTTP 429 限流"
+    return {"body": body.strip(), "http_code": http_code, "ms": ms,
+            "rc": rc, "error": err, "error_cn": err_cn}
+
+def _geo_result(name, r, cc=None, country=None, error=None, error_cn=None):
+    if cc and not error:
+        return {"src": name, "ok": True, "cc": cc, "country": country,
+                "ms": r["ms"], "error": None, "error_cn": None}
+    return {"src": name, "ok": False, "cc": None, "country": None, "ms": r["ms"],
+            "error": error or r["error"] or "no_country",
+            "error_cn": error_cn or r["error_cn"] or "返回中无国家字段"}
+
+def _geo_ipapi(ip, max_time=5):
+    """ip-api.com（国内直连快，带中文国名）。免费限额约 45 次/分钟，超限返回 HTTP 429。"""
+    r = _curl_get(f"http://ip-api.com/json/{ip}?fields=status,message,countryCode,country&lang=zh-CN", max_time)
+    if r["error"]:
+        return _geo_result("ip-api.com", r)
+    try:
+        d = json.loads(r["body"])
+    except Exception:
+        return _geo_result("ip-api.com", r, error="bad_json", error_cn="返回非 JSON")
+    if d.get("status") != "success":
+        msg = d.get("message") or "未知"
+        return _geo_result("ip-api.com", r, error="api_fail", error_cn=f"接口返回失败({msg})")
+    return _geo_result("ip-api.com", r, d.get("countryCode"), d.get("country"))
+
+def _geo_baidu(ip, max_time=5):
+    """百度企服（国内兜底）。"""
+    r = _curl_get(f"https://qifu-api.baidubce.com/ip/geo/v1/district?ip={ip}", max_time)
+    if r["error"]:
+        return _geo_result("百度企服", r)
+    m = re.search(r'"country":"([^"]*)"', r["body"])
+    if not m or not m.group(1):
+        return _geo_result("百度企服", r)
+    country = m.group(1)
+    return _geo_result("百度企服", r, "CN" if country == "中国" else "XX", country)
+
+def _geo_ipinfo(ip, max_time=6):
+    """ipinfo.io 公开接口（对海外 IP 判定权威）。country 为两字母码。"""
+    r = _curl_get(f"https://ipinfo.io/{ip}/json", max_time)
+    if r["error"]:
+        return _geo_result("ipinfo.io", r)
+    try:
+        d = json.loads(r["body"])
+    except Exception:
+        return _geo_result("ipinfo.io", r, error="bad_json", error_cn="返回非 JSON")
+    if d.get("bogon"):
+        return _geo_result("ipinfo.io", r, error="bogon", error_cn="保留/内网地址")
+    cc = d.get("country")
+    return _geo_result("ipinfo.io", r, cc, CC_ZH.get(cc, cc) if cc else None)
+
+_GEO_DEFAULT_TIMEOUT = {_geo_ipapi: 5, _geo_baidu: 5, _geo_ipinfo: 6}
+
+def geo_lookup_detail(ip, prefer_oversea=False, budget=None):
+    """多源归属地查询（结构化）。返回:
+       {cc, country, source, tried:[{src, ok, cc, country, ms, error, error_cn}], error, error_cn}
+       源顺序：代理通道 ipinfo.io → ip-api.com → 百度；DIRECT 通道 ip-api.com → 百度 → ipinfo.io。
+       总预算 budget 秒（默认 GEO_BUDGET），剩余不足 1s 的源记为“预算用尽”跳过。"""
+    budget = GEO_BUDGET if budget is None else budget
+    order = (_geo_ipinfo, _geo_ipapi, _geo_baidu) if prefer_oversea else (_geo_ipapi, _geo_baidu, _geo_ipinfo)
+    names = {_geo_ipinfo: "ipinfo.io", _geo_ipapi: "ip-api.com", _geo_baidu: "百度企服"}
+    t0 = time.time()
+    tried = []
+    for fn in order:
+        remain = budget - (time.time() - t0)
+        if remain < 1:
+            tried.append({"src": names[fn], "ok": False, "cc": None, "country": None, "ms": 0,
+                          "error": "skipped", "error_cn": "预算用尽未查询"})
+            continue
+        r = fn(ip, max_time=max(1, min(_GEO_DEFAULT_TIMEOUT[fn], int(remain))))
+        tried.append(r)
+        if r["ok"]:
+            return {"cc": r["cc"], "country": r["country"], "source": r["src"],
+                    "tried": tried, "error": None, "error_cn": None}
+    summary = " / ".join(f"{t['src']} {t['error_cn']}" for t in tried)
+    return {"cc": None, "country": None, "source": None, "tried": tried,
+            "error": "all_failed", "error_cn": summary}
+
+_GEO_CACHE = {}       # (ip, prefer_oversea) -> (ts, result)
+_GEO_INFLIGHT = {}    # (ip, prefer_oversea) -> {"ev": Event, "res": result|None}
+_GEO_LOCK = threading.Lock()
+
+def _geo_tag(r, cached, shared, age):
+    out = dict(r)
+    out["cached"], out["shared"], out["cache_age_s"] = cached, shared, age
+    return out
+
+def geo_lookup_cached(ip, prefer_oversea=False):
+    """带缓存 + 并发去重的归属地查询。返回 geo_lookup_detail 的结构，另加:
+       cached(命中缓存) / shared(复用同轮其他探针的查询) / cache_age_s(缓存年龄秒)"""
+    key = (ip, bool(prefer_oversea))
+    now = time.time()
+    with _GEO_LOCK:
+        hit = _GEO_CACHE.get(key)
+        if hit and GEO_CACHE_TTL > 0 and now - hit[0] < GEO_CACHE_TTL:
+            return _geo_tag(hit[1], True, False, int(now - hit[0]))
+        slot = _GEO_INFLIGHT.get(key)
+        leader = slot is None
+        if leader:
+            slot = {"ev": threading.Event(), "res": None}
+            _GEO_INFLIGHT[key] = slot
+    if not leader:
+        # 同一出口 IP 已有探针在查：等待其结果（领头查询受 GEO_BUDGET 约束）
+        if slot["ev"].wait(GEO_BUDGET + 1):
+            if slot["res"] is not None:
+                return _geo_tag(slot["res"], False, True, 0)
+            # 领头查询异常退出 → 自己查一次
+            return _geo_tag(geo_lookup_detail(ip, prefer_oversea), False, False, 0)
+        return {"cc": None, "country": None, "source": None, "tried": [],
+                "error": "wait_timeout", "error_cn": "等待同 IP 查询超时",
+                "cached": False, "shared": True, "cache_age_s": None}
+    r = None
+    try:
+        r = geo_lookup_detail(ip, prefer_oversea)
+        if r["cc"] and GEO_CACHE_TTL > 0:
+            with _GEO_LOCK:
+                _GEO_CACHE[key] = (time.time(), r)
+                if len(_GEO_CACHE) > GEO_CACHE_MAX:
+                    oldest = min(_GEO_CACHE, key=lambda k: _GEO_CACHE[k][0])
+                    _GEO_CACHE.pop(oldest, None)
+        slot["res"] = r
+    finally:
+        slot["ev"].set()
+        with _GEO_LOCK:
+            _GEO_INFLIGHT.pop(key, None)
+    return _geo_tag(r, False, False, 0)
+
+def geo_cache_info():
+    with _GEO_LOCK:
+        now = time.time()
+        live = sum(1 for ts, _ in _GEO_CACHE.values() if now - ts < GEO_CACHE_TTL)
+        return {"ttl": GEO_CACHE_TTL, "size": len(_GEO_CACHE), "live": live}
 
 def geo_lookup(ip, prefer_oversea=False):
-    """
-    查询 IP 归属地，返回 (国码, 国家中文名)。多源冗余，任一成功即返回。
-    源顺序按场景优化：
-      - prefer_oversea=True（海外探针）：ipinfo.io 优先（对海外 IP 判定更权威），再 ip-api.com、百度兜底
-      - prefer_oversea=False（国内探针）：ip-api.com 优先（国内直连快），再百度、ipinfo.io 兜底
-    """
-    if prefer_oversea:
-        order = (_geo_ipinfo, _geo_ipapi, _geo_baidu)
-    else:
-        order = (_geo_ipapi, _geo_baidu, _geo_ipinfo)
-    for src in order:
-        r = src(ip)
-        if r and r[0]:
-            return r
-    return None, None
+    """向后兼容包装：返回 (国码, 国家中文名)，失败为 (None, None)。"""
+    r = geo_lookup_detail(ip, prefer_oversea)
+    return r["cc"], r["country"]
 
 # =====================================================================
 # PPTP/GRE 状态：读 /proc/net/nf_conntrack（零 conntrack 命令依赖）
@@ -667,8 +851,10 @@ def _probe_one(pcfg, dns_server=None):
             "geo_expect": geo_expect_label(gspec), "geo_status": None,
             "geo_strict": GEO_STRICT, "crosstalk": None,
             "resolved": None, "dns_server": None, "dns_rcode": None, "dns_rtt": None, "dns_error": None,
-            "exit_ip": None, "latency": None,
+            "exit_ip": None, "latency": None, "l2": None, "l2_error": None, "l2_error_cn": None,
             "cc": None, "country": None, "geo_ok": None, "ok": True,
+            "geo_source": None, "geo_tried": None, "geo_error": None, "geo_error_cn": None,
+            "geo_cached": False, "geo_shared": False, "geo_cache_age": None,
             "levels": {}}
     # L1: domain 可能带路径(如 ipinfo.io/ip)——DNS 解析只取主机名部分
     host = domain.split("/")[0]
@@ -682,18 +868,26 @@ def _probe_one(pcfg, dns_server=None):
     item["levels"]["L1"] = bool(resolved)
     if not resolved:
         item["ok"] = False
-    # L2: 出口 IP + 延迟
-    exit_ip, latency = get_exit_ip(domain)
+    # L2: 出口 IP + 延迟（v2.4：默认用 L1 的 IPv4 解析结果 --resolve，与 L1 同一台 DNS；L1 无 IPv4 时回退系统 DNS）
+    rip = dnsr["ip"] if (L2_RESOLVE == "l1" and dnsr["ip"]) else None
+    l2 = l2_probe(domain, resolve_ip=rip)
+    exit_ip, latency = l2["ip"], l2["latency"]
     item["exit_ip"] = exit_ip
     item["latency"] = latency
+    item["l2"] = l2
+    item["l2_error"], item["l2_error_cn"] = l2["error"], l2["error_cn"]
     item["levels"]["L2"] = bool(exit_ip)
     if not exit_ip:
         item["ok"] = False
     # L4: 归属地——回答“这条线路在哪”，与通道预期比对；默认不一致仅提示
     if exit_ip:
         # 代理通道(非 DIRECT)优先 ipinfo.io，对海外 IP 判定更准（v2.3 修正：原仅 oversea 角色生效）
-        cc, country = geo_lookup(exit_ip, prefer_oversea=(channel != "DIRECT"))
+        g = geo_lookup_cached(exit_ip, prefer_oversea=(channel != "DIRECT"))
+        cc, country = g["cc"], g["country"]
         item["cc"], item["country"] = cc, country
+        item["geo_source"], item["geo_tried"] = g["source"], g["tried"]
+        item["geo_error"], item["geo_error_cn"] = g["error"], g["error_cn"]
+        item["geo_cached"], item["geo_shared"], item["geo_cache_age"] = g["cached"], g["shared"], g["cache_age_s"]
         m = geo_match(cc, gspec)
         if m is True:
             item["geo_ok"], item["geo_status"] = True, "match"
@@ -701,6 +895,8 @@ def _probe_one(pcfg, dns_server=None):
             item["geo_ok"], item["geo_status"] = False, "mismatch"
             if GEO_STRICT:
                 item["ok"] = False
+    else:
+        item["geo_error"], item["geo_error_cn"] = "skipped", "L2 未取到出口，跳过"
     return item
 
 def run_probes():
@@ -721,7 +917,8 @@ def run_probes():
                 "channel": ch, "geo_expect": geo_expect_label(_geo_spec(ch, pcfg.get("want"))),
                 "geo_status": None, "geo_strict": GEO_STRICT, "crosstalk": None,
                 "resolved": None, "dns_server": dsel["server"], "dns_rcode": None, "dns_rtt": None, "dns_error": "timeout",
-                "exit_ip": None, "latency": None,
+                "exit_ip": None, "latency": None, "l2": None,
+                "l2_error": "timeout", "l2_error_cn": "探针整体超时",
                 "cc": None, "country": None, "geo_ok": None, "ok": False,
                 "levels": {"L1": False, "L2": False}, "timeout": True}
     results = [None] * len(PROBES)
@@ -791,6 +988,10 @@ def run_probes():
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "dns": dsel["server"] + ("" if dsel["ok"] else "（无应答）"),
         "dns_select": dsel,
+        "geo_cache": dict(geo_cache_info(),
+                          hits=sum(1 for it in results if it.get("geo_cached")),
+                          shared=sum(1 for it in results if it.get("geo_shared")),
+                          lookups=sum(1 for it in results if it.get("geo_tried") and not it.get("geo_cached") and not it.get("geo_shared"))),
         "probes": results,
         "split": split,
         "pptp": pptp,
@@ -863,7 +1064,7 @@ def read_pptp_history(n=60):
 # HTTP 服务
 # =====================================================================
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ExitProbe/2.3"
+    server_version = "ExitProbe/2.4"
 
     def log_message(self, fmt, *args):
         pass
@@ -921,6 +1122,9 @@ class Handler(BaseHTTPRequestHandler):
                 "channels": {r: channel_of(r) for r in sorted(set(p["role"] for p in PROBES))},
                 "geo_expect": {channel_of(p["role"]): geo_expect_label(_geo_spec(channel_of(p["role"]), p.get("want"))) for p in PROBES},
                 "geo_strict": GEO_STRICT,
+                "l2_resolve": L2_RESOLVE,
+                "geo_budget": GEO_BUDGET,
+                "geo_cache": geo_cache_info(),
                 "roles": sorted(set(p["role"] for p in PROBES)),
                 "probes": PROBES,
             }
@@ -960,7 +1164,7 @@ def _selfheal_symlink_loop():
 
 def main():
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    print(f"[probe_server v2.3] http://{LISTEN_HOST}:{LISTEN_PORT}  PROBE_DNS={PROBE_DNS_RAW} IFACES={','.join(DNS_IFACES)}")
+    print(f"[probe_server v2.4] http://{LISTEN_HOST}:{LISTEN_PORT}  PROBE_DNS={PROBE_DNS_RAW} IFACES={','.join(DNS_IFACES)}")
     try:
         sel = select_dns_server(force=True)
         print(f"[probe_server] L1 DNS 选中 {sel['server']}({sel['source']}) ok={sel['ok']}  候选={[t['server'] for t in sel['tried']]}")

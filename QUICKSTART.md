@@ -86,6 +86,18 @@ PROBE_GEO_DIRECT=HK    # DIRECT 线路本身在香港时设置（可写 CN,HK / 
 PROBE_GEO_STRICT=0     # 1 = 归属地不一致也判失败
 ```
 
+### L2 出口探测解析来源（v2.4）
+
+L2 默认用 L1 的解析结果 `curl --resolve` 直连（与 L1 同一台 DNS），失败时看板显示具体原因（超时/连接失败/HTTP 跳转等），悬停可看分段耗时。
+
+```bash
+PROBE_L2_RESOLVE=l1       # 默认；system = 走系统 DNS（v2.3 行为）
+curl -4 -s --max-time 8 --resolve ifconfig.me:80:<L1解析IP> http://ifconfig.me   # 手动复现
+PROBE_GEO_BUDGET=10       # L4 归属地三源查询总预算(秒)，失败时看板逐源显示原因
+PROBE_GEO_CACHE_TTL=3600  # L4 归属地按出口 IP 缓存秒数(0=关闭)；出口 IP 变化自动重查，重启服务清空
+curl -s 'http://ip-api.com/json/<出口IP>?fields=status,message,countryCode,country'   # 手动复现 L4
+```
+
 > **nginx 由 probe 服务托管**
 
 ### API 一览

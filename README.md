@@ -182,6 +182,71 @@ sudo bash /tmp/vyos-net-probe/deploy.sh
 
 > 判断是 A 还是 B：看国内探针与香港探针的 L2 出口 IP——不同为 A，相同为 B（v2.3 会直接显示串线）。
 
+## v2.4 L2 出口探测加固 + 与 L1 同一台 DNS
+
+**探针实际执行的命令**（每个探针一条，9 个并发）：
+
+```bash
+# 默认 PROBE_L2_RESOLVE=l1：用 L1 从 10.60.2.254 解析出的 IPv4 直连
+curl -4 -s --max-time 8 \
+  -w '\n__L2_METRICS__%{http_code} %{time_namelookup} %{time_connect} %{time_total} %{remote_ip}' \
+  --resolve ifconfig.me:80:34.160.111.145 http://ifconfig.me
+
+# L1 没拿到 IPv4 或 PROBE_L2_RESOLVE=system：不加 --resolve，走系统 DNS
+curl -4 -s --max-time 8 -w '…同上…' http://ifconfig.me
+```
+
+**改进**：
+
+- `-4` 强制 IPv4，避免走 IPv6 后返回 IPv6 地址被判“无响应”。
+- `--resolve`：L2 使用 L1 的解析结果，L1 与 L2 解析来源一致；L1 无 IPv4 时自动回退系统 DNS（结果 `l2.via=system`）。
+- `-w` 记录 HTTP 状态码、DNS/建连/总耗时、实际连接目标 IP；**延迟改为 curl 自身 `time_total`**（不含进程启动开销，数值会比 v2.3 略小）。
+- 失败原因：按 curl 退出码与 HTTP 状态码归纳，看板 L2 行直接显示。
+- 仅 HTTP 2xx 且返回内容含 IPv4 才算成功（v2.3 会把 403 错误页里的 IP 误当出口）。
+
+| 失败显示 | 来源 |
+|------|------|
+| 超时 | curl 退出码 28 |
+| 连接失败(拒绝/不可达) | 7 |
+| 域名解析失败 | 6（系统 DNS 回退时） |
+| 接收失败(连接被重置) | 56 |
+| HTTP 301 跳转(探针不跟随跳转) / HTTP 403 … | HTTP 状态码 |
+| 返回内容中无 IPv4 | HTTP 200 但无 IP |
+| curl 执行失败 | 未安装或被外层强制终止 |
+
+结果新增字段：`l2`（via/resolve_ip/http_code/t_dns_ms/t_connect_ms/t_total_ms/remote_ip/curl_rc/error/error_cn）、`l2_error`、`l2_error_cn`；`/api/mode` 返回 `l2_resolve`。
+
+> mihomo 为 `redir-host` 模式且未启用 sniffer：curl 直连 IP 时，mihomo 靠自身 DNS 缓存把 IP 还原成域名再匹配规则。L1 正是向 mihomo DNS(10.60.2.254) 查询的，缓存命中；若部署后出现串线或 L3 分流异常，可先设 `PROBE_L2_RESOLVE=system` 对比。
+
+### L4 归属地失败原因（v2.4）
+
+L4 依次尝试三个数据源（代理通道：ipinfo.io → ip-api.com → 百度企服；DIRECT 通道：ip-api.com → 百度企服 → ipinfo.io），任一成功即采用。原来全部失败只显示「查询失败」，现在逐源给出原因：
+
+| 显示 | 含义 |
+|------|------|
+| 超时 / 连接失败 / 接收失败 … | curl 退出码（同 L2） |
+| HTTP 429 限流 | ip-api.com 免费额度约 45 次/分钟，看板高频刷新时容易触发 |
+| 接口返回失败(…) | ip-api.com 返回 `status=fail`，括号内为接口给出的原因 |
+| 返回中无国家字段 / 返回非 JSON | 接口格式变化或被拦截返回了错误页 |
+| 保留/内网地址 | ipinfo.io 判定为 bogon |
+| 预算用尽未查询 | 前面的源耗尽了 `PROBE_GEO_BUDGET`（默认 10s），后续源跳过 |
+| 未查询（L2 未取到出口，跳过） | L2 失败，无 IP 可查 |
+
+- 看板 L4 行：失败时显示 `✘ 查询失败 (ipinfo.io 超时；ip-api.com HTTP 429 限流；…)`；成功时悬停可见每个源的结果、耗时及最终采用的源。
+- **新增总预算** `PROBE_GEO_BUDGET`：原来三源最坏 5+5+6s，加上 L1/L2 会撞到 25s 硬超时，卡片只剩「⏱ 超时」，L4 原因无法回传。
+- L4 判定仍不影响通过/失败（`PROBE_GEO_STRICT=1` 时仅「归属地不一致」影响，查询失败不影响）。
+- 结果新增字段：`geo_source`、`geo_tried`（src/ok/cc/country/ms/error/error_cn）、`geo_error`、`geo_error_cn`；`/api/mode` 返回 `geo_budget`。
+
+### L4 归属地缓存（v2.4）
+
+- **按出口 IP 缓存**：成功结果按（出口 IP，数据源顺序）缓存 `PROBE_GEO_CACHE_TTL` 秒（默认 3600，`0`=关闭）。出口 IP 一变，缓存键随之变化，自动重新查询，因此 TTL 可以设得较长。
+- **同轮并发去重**：同一轮里多个探针出口 IP 相同时只查一次，其余探针等待复用结果。正常三出口时 9 个探针只发起 3 次查询；之后在 TTL 内为 0 次。
+- **失败不缓存**：查询失败时下一轮会重新查询，不会把一次限流/超时固定下来。
+- 效果：每轮检测少等一次归属地查询（缓存命中时 L4 耗时≈0），ip-api.com 的 429 限流基本消失。
+- 看板：命中缓存时 L4 行附 `·缓存`，悬停显示「缓存命中（N 秒前查询）」；复用同轮结果时悬停注明。
+- 结果新增字段：`geo_cached`、`geo_shared`、`geo_cache_age`；顶层新增 `geo_cache`（ttl/size/live/hits/shared/lookups，本轮统计）；`/api/mode` 返回 `geo_cache`。
+- 缓存在进程内存中，`systemctl restart probe` 即清空。
+
 ## 自定义探针
 
 编辑 `probe_server.py` 顶部 `PROBES` 列表增减探测域名：

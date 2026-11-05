@@ -117,6 +117,27 @@
 | 9.7 | 接口字段 | `curl -s http://127.0.0.1:8899/api/probe \| python3 -m json.tool \| grep -E 'channel\|geo_expect\|geo_status\|crosstalk'` | 每个探针均有这些字段 | ☐ |
 | 9.8 | 模式接口 | `curl -s http://127.0.0.1:8899/api/mode \| python3 -m json.tool` | 含 `channels`、`geo_expect`、`geo_strict` | ☐ |
 
+## 10. v2.4 L2 加固 + 与 L1 同一台 DNS
+
+| # | 项 | 命令 / 操作 | 预期 | 结果 |
+|---|------|------------|------|------|
+| 10.1 | 解析来源 | `curl -s http://127.0.0.1:8899/api/probe \| python3 -m json.tool \| grep -E '"via"\|resolve_ip'` | `via` 为 `l1`，`resolve_ip` 等于该探针的 `resolved` | ☐ |
+| 10.2 | 手动复现 | `curl -4 -s --max-time 8 --resolve ifconfig.me:80:<resolved> http://ifconfig.me` | 返回的 IP 与看板 L2 出口一致 | ☐ |
+| 10.3 | 分流仍正确 | 看板 L3 与各卡片 | L3 分流生效、无串线（与 `PROBE_L2_RESOLVE=system` 结果一致） | ☐ |
+| 10.4 | 分段耗时 | 鼠标悬停 L2 出口 / 延迟 | 显示解析来源、HTTP 状态码、DNS/建连/总耗时；延迟行附 `(建连 Nms)` | ☐ |
+| 10.5 | 失败原因 | 临时把某探针域名改为不可达地址后重启 | L2 显示 `✘ 超时` 或 `✘ 连接失败(拒绝/不可达)`，不再是笼统“无响应” | ☐ |
+| 10.6 | L1 失败回退 | `PROBE_DNS=192.0.2.1` 前台跑一次 | L1 `无响应/超时`，L2 `via=system` 仍能取到出口 IP | ☐ |
+| 10.7 | 切回旧行为 | `PROBE_L2_RESOLVE=system` 重启 | 命令不带 `--resolve`，`via=system` | ☐ |
+| 10.8 | 模式接口 | `curl -s http://127.0.0.1:8899/api/mode \| python3 -m json.tool \| grep l2_resolve` | `"l2_resolve": "l1"` | ☐ |
+| 10.9 | L4 来源 | 鼠标悬停 L4 归属地 | 列出各数据源结果/耗时，标出「← 采用」 | ☐ |
+| 10.10 | L4 失败原因 | 连续快速点「立即检测」多次（触发 ip-api.com 限流） | 若全部失败，L4 显示 `✘ 查询失败 (… HTTP 429 限流 …)`，不再是笼统「查询失败」 | ☐ |
+| 10.11 | L4 预算 | `curl -s http://127.0.0.1:8899/api/probe \| python3 -m json.tool \| grep -A3 geo_tried` | 每个源有 `ms`/`error_cn`；超预算的源为「预算用尽未查询」 | ☐ |
+| 10.12 | L2 失败联动 | 某探针 L2 失败时 | L4 显示「未查询（L2 未取到出口，跳过）」 | ☐ |
+| 10.13 | 缓存冷启动 | `systemctl restart probe` 后首次 `curl -s http://127.0.0.1:8899/api/probe \| python3 -c 'import sys,json;print(json.load(sys.stdin)["geo_cache"])'` | `lookups` = 不同出口 IP 数（三出口通常 3），`shared` = 其余探针数 | ☐ |
+| 10.14 | 缓存命中 | 立即再请求一次同上命令 | `hits=9`、`lookups=0`；看板 L4 行附 `·缓存`，悬停显示缓存年龄 | ☐ |
+| 10.15 | 耗时下降 | `time curl -s http://127.0.0.1:8899/api/probe >/dev/null` 对比首次与第二次 | 第二次明显更快（省去归属地查询） | ☐ |
+| 10.16 | 关闭缓存 | `PROBE_GEO_CACHE_TTL=0` 重启 | 每轮 `hits=0`，仍有同轮去重（`shared` > 0） | ☐ |
+
 ## 回滚方法（如需）
 
 - 代码回滚：`git checkout <上一个提交> -- probe_server.py index.html` 后 `systemctl restart probe`。

@@ -287,14 +287,29 @@ function renderCard(p){
                           : `<span class="v fail">${dnsFail}</span> ${badge(false)}${dnsRtt}`;
   // v2.3 串线：出口 IP 与其他通道相同 → 标红（规则没命中/掉进兜底）
   const xt = (p.crosstalk && p.crosstalk.length) ? p.crosstalk.join('/') : '';
-  const exitV = !p.exit_ip ? `<span class="v fail">✘ 无响应</span> ${badge(false)}`
+  // v2.4 L2 失败给出具体原因(超时/连接失败/HTTP 跳转/无 IPv4…)；悬停显示分段耗时与解析来源
+  const l2 = p.l2 || null;
+  const l2Tip = l2 ? [
+      `解析来源：${l2.via==='l1' ? 'L1 结果 --resolve '+(l2.resolve_ip||'') : '系统 DNS'}`,
+      `HTTP ${l2.http_code ?? '—'} · 连接目标 ${l2.remote_ip || '—'}`,
+      `DNS ${l2.t_dns_ms ?? '—'}ms · 建连 ${l2.t_connect_ms ?? '—'}ms · 总 ${l2.t_total_ms ?? '—'}ms`,
+      (l2.curl_rc ? `curl 退出码 ${l2.curl_rc}` : '')
+    ].filter(Boolean).join('\n') : '';
+  const l2Fail = p.l2_error_cn || '无响应';
+  const exitV = !p.exit_ip ? `<span class="v fail" title="${l2Tip}">✘ ${l2Fail}</span> ${badge(false)}`
               : (xt ? `<span class="v ip">${p.exit_ip}</span> <span class="v fail">✘ 串线：与 ${xt} 相同</span>`
                     : `<span class="v ip">${p.exit_ip}</span> ${badge(true)}`);
-  const latV = (p.latency!=null) ? `<span class="v lat">${p.latency} ms</span>` : `<span class="v dimv">—</span>`;
+  const latV = (p.latency!=null)
+      ? `<span class="v lat" title="${l2Tip}">${p.latency} ms</span>${(l2 && l2.t_connect_ms!=null) ? ` <span class="v dimv">(建连 ${l2.t_connect_ms}ms)</span>` : ''}`
+      : `<span class="v dimv">—</span>`;
   let geoV;
   // v2.3 归属地只回答“线路在哪”：符合预期 ✔；不一致默认黄色提示(不判失败)，PROBE_GEO_STRICT=1 时红色判失败
   const gst = p.geo_status || (p.geo_ok===true ? 'match' : (p.geo_ok===false ? 'mismatch' : null));
   const gexp = p.geo_expect ? `预期 ${p.geo_expect}` : '';
+  // v2.4 归属地悬停：各数据源结果与耗时，标出最终采用的源
+  const geoCacheLine = p.geo_cached ? `缓存命中（${p.geo_cache_age ?? '?'} 秒前查询，以下为当时结果）`
+                     : (p.geo_shared ? '复用本轮同出口 IP 其他探针的查询结果' : '');
+  const geoTip = [geoCacheLine, ...(p.geo_tried||[]).map(t=>`${t.src}：${t.ok ? (t.country||'')+' ('+t.cc+')' : (t.error_cn||'失败')} · ${t.ms ?? '—'}ms${t.src===p.geo_source ? ' ← 采用' : ''}`)].filter(Boolean).join('\n');
   if(p.cc){
     let warn;
     if(gst==='match') warn = ' <span style="color:var(--green)">✔</span>';
@@ -303,7 +318,13 @@ function renderCard(p){
         ? ` <span style="color:var(--red)">⚠不符${gexp ? '（'+gexp+'）' : ''}</span>`
         : ` <span style="color:var(--yellow)" title="归属地与通道预期不同，仅提示不判失败；可用 PROBE_GEO_${p.channel||''} 调整预期">ⓘ 线路所在地${gexp ? '·'+gexp : ''}</span>`;
     } else warn = '';
-    geoV = `<span class="v">${p.country||''} (${p.cc})</span>${warn}`;
+    geoV = `<span class="v" title="${geoTip}">${p.country||''} (${p.cc})</span>${warn}${p.geo_cached ? ' <span class="v dimv" title="'+geoTip+'">·缓存</span>' : ''}`;
+  } else if(p.geo_error==='skipped'){
+    geoV = `<span class="v dimv">— 未查询（${p.geo_error_cn||'L2 未取到出口'}）</span>`;
+  } else if(p.geo_tried && p.geo_tried.length){
+    // v2.4 逐源失败原因：卡片上显示精简版，悬停显示完整列表
+    const brief = p.geo_tried.map(t=>`${t.src} ${t.error_cn||'失败'}`).join('；');
+    geoV = `<span class="v fail" title="${geoTip}">✘ 查询失败</span> <span class="v dimv">(${brief}，不影响判定)</span>`;
   } else geoV = `<span class="v dimv">查询失败(不影响判定)</span>`;
   const verdict = p.ok
       ? `<div class="verdict ok">══> 通过</div>`

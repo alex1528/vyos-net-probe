@@ -19,6 +19,15 @@ Environment=PROBE_PORT=8899
 #   注：mihomo DNS 若只监听内网网卡 IP（非 127.0.0.1），旧值 127.0.0.1 会导致 L1 全部"无响应/超时"
 Environment=PROBE_DNS=auto
 Environment=PROBE_DNS_IFACES=eth2,eth3
+# L2 出口探测的域名解析来源（v2.4）：
+#   l1     = 用 L1 解析结果 curl --resolve host:80:IP，与 L1 同一台 DNS（默认）
+#   system = 走系统 DNS(/etc/resolv.conf)，即 v2.3 及以前行为
+Environment=PROBE_L2_RESOLVE=l1
+# L4 归属地多源查询总预算(秒，v2.4)；超出则跳过后续数据源，保证失败原因能在硬超时前回传
+Environment=PROBE_GEO_BUDGET=10
+# L4 归属地按出口 IP 缓存秒数(v2.4)，0=关闭；出口 IP 变化会自动重新查询，失败结果不缓存
+#   同一轮内同一出口 IP 只查一次（9 个探针通常只查 3 次）
+Environment=PROBE_GEO_CACHE_TTL=3600
 # L4 归属地预期（v2.3，按出口通道）：CN | HK | CN,HK | !CN | any；未设置则 DIRECT=CN、代理=!CN
 #   归属地只表示“线路在哪”，不一致默认仅提示；是否走错出口由“串线检测”(出口IP相同)判定
 #   若 DIRECT 线路本身在香港，取消下一行注释即可消除提示
