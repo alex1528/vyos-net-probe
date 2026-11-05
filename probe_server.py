@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 =====================================================================
- 出口分流探针后端服务  (probe_server.py)  v2.0
+ 出口分流探针后端服务  (probe_server.py)  v2.2
 =====================================================================
  功能：
-   - L1 DNS 解析：纯 socket 构造 DNS 查询包问本地代理 DNS（零 dig 依赖）
+   - L1 DNS 解析：纯 socket 构造 DNS 查询包问本地代理 DNS（零 dig 依赖，等价 dig @IP；
+     默认自动取 eth2/eth3 网卡 IP 作为 DNS 服务器，可用 PROBE_DNS 指定）
    - L2 出口探测：curl 取出口 IP + 测量延迟
    - L4 归属地：多源冗余查询（附加信息，不影响核心判定）
    - L3 分流校验：海外出口 IP ≠ 国内出口 IP
@@ -28,6 +29,7 @@ import socket
 import struct
 import random
 import subprocess
+import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta
@@ -37,7 +39,15 @@ from urllib.parse import urlparse, parse_qs
 # ---------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------
-DNS_SERVER  = os.environ.get("PROBE_DNS", "127.0.0.1")
+# L1 DNS 服务器（v2.2）：等价 `dig <域名> @<IP>`
+#   PROBE_DNS=auto(默认)         → 依次取 PROBE_DNS_IFACES 网卡的 IPv4，最后回退 127.0.0.1
+#   PROBE_DNS=10.60.2.254         → 固定 IP（可逗号分隔多个，按顺序择优）
+#   PROBE_DNS=eth2,eth3           → 直接写网卡名，运行时解析其 IPv4
+#   启动/每 PROBE_DNS_SELECT_TTL 秒做一次快速探活，选第一个“有应答”的服务器供全部探针使用
+PROBE_DNS_RAW = os.environ.get("PROBE_DNS", "auto").strip() or "auto"
+DNS_IFACES = [x.strip() for x in os.environ.get("PROBE_DNS_IFACES", "eth2,eth3").split(",") if x.strip()]
+DNS_SELECT_TTL = int(os.environ.get("PROBE_DNS_SELECT_TTL", "60"))
+DNS_SERVER  = "127.0.0.1"   # 兜底值（兼容旧引用）；实际以 select_dns_server() 选出的为准
 LISTEN_HOST = os.environ.get("PROBE_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("PROBE_PORT", "8899"))
 CURL_TIMEOUT = 8
@@ -268,7 +278,7 @@ def _dns_resolve_qtype(host, qtype, server, port, timeout, retries):
         last_rcode = rcode                       # 仍为网络失败，继续重试
     return last_rcode, None
 
-def dns_resolve(host, server=DNS_SERVER, port=53, timeout=None, retries=None, want_aaaa=None):
+def dns_resolve(host, server=None, port=53, timeout=None, retries=None, want_aaaa=None):
     """结构化 DNS 解析（L1 核心）。返回:
        {ok, ip, ipv6, rcode, rtt_ms, error}
        - ok: 是否拿到 A 或 AAAA 地址
@@ -278,13 +288,16 @@ def dns_resolve(host, server=DNS_SERVER, port=53, timeout=None, retries=None, wa
     timeout = DNS_TIMEOUT if timeout is None else timeout
     retries = DNS_RETRIES if retries is None else retries
     want_aaaa = DNS_QUERY_AAAA if want_aaaa is None else want_aaaa
-    out = {"ok": False, "ip": None, "ipv6": None,
+    if not server:
+        server = select_dns_server()["server"]
+    out = {"ok": False, "ip": None, "ipv6": None, "server": server,
            "rcode": None, "rtt_ms": None, "error": None}
     t0 = time.time()
     rcode_a, ip = _dns_resolve_qtype(host, 1, server, port, timeout, retries)
     out["ip"] = ip
     out["rcode"] = _DNS_RCODE.get(rcode_a, rcode_a) if rcode_a is not None else None
-    if want_aaaa and not ip:
+    # A 有应答但无地址时才补查 AAAA；A 完全无应答(服务器不通)时补查无意义，直接跳过省一半耗时
+    if want_aaaa and not ip and rcode_a is not None:
         rcode_6, ip6 = _dns_resolve_qtype(host, 28, server, port, timeout, retries)
         out["ipv6"] = ip6
         if ip6 and rcode_a is None:
@@ -298,10 +311,81 @@ def dns_resolve(host, server=DNS_SERVER, port=53, timeout=None, retries=None, wa
         out["error"] = out["rcode"]        # NXDOMAIN / SERVFAIL / REFUSED / NOERROR(无A)
     return out
 
-def dns_query_a(domain, server=DNS_SERVER, port=53, timeout=None):
+def dns_query_a(domain, server=None, port=53, timeout=None):
     """向后兼容包装：仅返回首个 IPv4（或 None）。内部走结构化 dns_resolve。"""
     return dns_resolve(domain, server=server, port=port,
                        timeout=timeout, want_aaaa=False)["ip"]
+
+# ---------------------------------------------------------------------
+# L1 DNS 服务器选择（v2.2）：网卡 IP 自动探测 + 探活择优 + 缓存
+# ---------------------------------------------------------------------
+def _iface_ipv4(ifname):
+    """取网卡 IPv4：优先 ioctl(SIOCGIFADDR，零依赖)，失败回退 `ip -4 -o addr show dev X`。"""
+    try:
+        import fcntl
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            req = struct.pack("256s", ifname[:15].encode("ascii", "ignore"))
+            res = fcntl.ioctl(s.fileno(), 0x8915, req)   # SIOCGIFADDR
+            return socket.inet_ntoa(res[20:24])
+        finally:
+            s.close()
+    except Exception:
+        pass
+    rc, out = sh(["ip", "-4", "-o", "addr", "show", "dev", ifname], 3)
+    m = re.search(r"inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", out or "")
+    return m.group(1) if m else None
+
+def dns_candidates():
+    """按 PROBE_DNS 生成候选 [(ip, 来源)]，去重保序。"""
+    cands, seen = [], set()
+    def add(ip, why):
+        if ip and ip not in seen:
+            seen.add(ip)
+            cands.append((ip, why))
+    for tok in [t.strip() for t in PROBE_DNS_RAW.split(",") if t.strip()]:
+        if tok.lower() == "auto":
+            for ifn in DNS_IFACES:
+                add(_iface_ipv4(ifn), f"iface:{ifn}")
+            add("127.0.0.1", "loopback")
+        elif IPV4_FULL.match(tok):
+            add(tok, "static")
+        else:                                   # 当作网卡名
+            add(_iface_ipv4(tok), f"iface:{tok}")
+    if not cands:
+        add(DNS_SERVER, "fallback")
+    return cands
+
+_DNS_SEL = {"ts": 0.0, "result": None}
+_DNS_SEL_LOCK = threading.Lock()
+
+def select_dns_server(force=False):
+    """探活择优：对每个候选发 1 次快速 A 查询，第一个“有应答”(任意 RCODE)的即选中。
+       成功结果缓存 DNS_SELECT_TTL 秒；全部无应答时返回首个候选并标 ok=False。"""
+    with _DNS_SEL_LOCK:
+        r = _DNS_SEL["result"]
+        if r and r["ok"] and not force and time.time() - _DNS_SEL["ts"] < DNS_SELECT_TTL:
+            return r
+    cands = dns_candidates()
+    test_host = PROBES[0]["domain"].split("/")[0] if PROBES else "ifconfig.me"
+    quick_to = min(DNS_TIMEOUT, 1.5)
+    tried, chosen = [], None
+    for ip, why in cands:
+        t0 = time.time()
+        rcode, _ = _dns_resolve_qtype(test_host, 1, ip, 53, quick_to, 1)
+        tried.append({"server": ip, "source": why, "ok": rcode is not None,
+                      "rtt_ms": int((time.time() - t0) * 1000)})
+        if rcode is not None:
+            chosen = (ip, why)
+            break
+    if chosen:
+        res = {"server": chosen[0], "source": chosen[1], "ok": True, "tried": tried}
+    else:
+        first = cands[0] if cands else (DNS_SERVER, "fallback")
+        res = {"server": first[0], "source": first[1], "ok": False, "tried": tried}
+    with _DNS_SEL_LOCK:
+        _DNS_SEL["ts"], _DNS_SEL["result"] = time.time(), res
+    return res
 
 def sh(cmd, timeout):
     """执行外部命令，返回 (rc, stdout_stripped)。"""
@@ -533,19 +617,20 @@ def pptp_status():
 # =====================================================================
 # 执行全部探针
 # =====================================================================
-def _probe_one(pcfg):
+def _probe_one(pcfg, dns_server=None):
     """单个探针的完整检测(L1解析 + L2出口 + L4归属地)。供并行调用。"""
     domain, expect, want, role = pcfg["domain"], pcfg["expect"], pcfg["want"], pcfg["role"]
     item = {"domain": domain, "expect": expect, "role": role,
-            "resolved": None, "dns_rcode": None, "dns_rtt": None, "dns_error": None,
+            "resolved": None, "dns_server": None, "dns_rcode": None, "dns_rtt": None, "dns_error": None,
             "exit_ip": None, "latency": None,
             "cc": None, "country": None, "geo_ok": None, "ok": True,
             "levels": {}}
     # L1: domain 可能带路径(如 ipinfo.io/ip)——DNS 解析只取主机名部分
     host = domain.split("/")[0]
-    dnsr = dns_resolve(host)
+    dnsr = dns_resolve(host, server=dns_server)
     resolved = dnsr["ip"] or dnsr["ipv6"]     # A 优先，回退 AAAA
     item["resolved"] = resolved
+    item["dns_server"] = dnsr["server"]        # 实际使用的 DNS 服务器(等价 dig @IP)
     item["dns_rcode"] = dnsr["rcode"]          # 失败归因:NXDOMAIN/SERVFAIL/REFUSED/...
     item["dns_rtt"]   = dnsr["rtt_ms"]         # DNS 解析耗时(ms)，可作慢速早期告警
     item["dns_error"] = dnsr["error"]
@@ -574,6 +659,8 @@ def _probe_one(pcfg):
 def run_probes():
     exits = {}
     passed = failed = 0
+    # L1：本轮先择优选出可用 DNS 服务器(eth2/eth3 IP → 127.0.0.1)，全部探针共用，避免每个探针各自超时
+    dsel = select_dns_server()
     # 并行执行所有探针(每个探针含 curl 出口 + 归属地，串行累加会超 nginx 超时)
     # 并发后总耗时 ≈ 最慢的单个探针，而非所有探针之和；
     # 并对每个探针设硬超时上限(PROBE_HARD_TIMEOUT)，任一探针卡死不阻塞整体返回。
@@ -583,7 +670,7 @@ def run_probes():
     def _timeout_item(pcfg):
         # 探针整体超时时的兜底结果(视为该探针失败)
         return {"domain": pcfg["domain"], "expect": pcfg["expect"], "role": pcfg["role"],
-                "resolved": None, "dns_rcode": None, "dns_rtt": None, "dns_error": "timeout",
+                "resolved": None, "dns_server": dsel["server"], "dns_rcode": None, "dns_rtt": None, "dns_error": "timeout",
                 "exit_ip": None, "latency": None,
                 "cc": None, "country": None, "geo_ok": None, "ok": False,
                 "levels": {"L1": False, "L2": False}, "timeout": True}
@@ -593,7 +680,7 @@ def run_probes():
     #   并用 as_completed 设“整批”硬上限(PROBE_HARD_TIMEOUT)，任何未完成的槽位统一兜底。
     ex = ThreadPoolExecutor(max_workers=min(8, len(PROBES) or 1))
     try:
-        futs = {ex.submit(_probe_one, pc): idx for idx, pc in enumerate(PROBES)}
+        futs = {ex.submit(_probe_one, pc, dsel["server"]): idx for idx, pc in enumerate(PROBES)}
         try:
             for fut in as_completed(futs, timeout=PROBE_HARD_TIMEOUT):
                 idx = futs[fut]
@@ -637,7 +724,8 @@ def run_probes():
     total = passed + failed
     data = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "dns": DNS_SERVER,
+        "dns": dsel["server"] + ("" if dsel["ok"] else "（无应答）"),
+        "dns_select": dsel,
         "probes": results,
         "split": split,
         "pptp": pptp,
@@ -710,7 +798,7 @@ def read_pptp_history(n=60):
 # HTTP 服务
 # =====================================================================
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ExitProbe/2.0"
+    server_version = "ExitProbe/2.2"
 
     def log_message(self, fmt, *args):
         pass
@@ -762,6 +850,9 @@ class Handler(BaseHTTPRequestHandler):
                 "exit_mode": EXIT_MODE,
                 "mode_label": "三出口(美国+香港+国内)" if EXIT_MODE == 3 else "两出口(海外+国内)",
                 "config_path": MIHOMO_CONFIG_PATH,
+                "dns_config": PROBE_DNS_RAW,
+                "dns_ifaces": DNS_IFACES,
+                "dns_select": select_dns_server(),
                 "roles": sorted(set(p["role"] for p in PROBES)),
                 "probes": PROBES,
             }
@@ -801,7 +892,12 @@ def _selfheal_symlink_loop():
 
 def main():
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    print(f"[probe_server v2.0] http://{LISTEN_HOST}:{LISTEN_PORT}  DNS={DNS_SERVER}")
+    print(f"[probe_server v2.2] http://{LISTEN_HOST}:{LISTEN_PORT}  PROBE_DNS={PROBE_DNS_RAW} IFACES={','.join(DNS_IFACES)}")
+    try:
+        sel = select_dns_server(force=True)
+        print(f"[probe_server] L1 DNS 选中 {sel['server']}({sel['source']}) ok={sel['ok']}  候选={[t['server'] for t in sel['tried']]}")
+    except Exception as e:
+        print(f"[probe_server] L1 DNS 择优失败：{e}")
     # 启动软链自愈守护线程（daemon，随主进程退出）
     if SELF_HEAL_INTERVAL > 0:
         import threading

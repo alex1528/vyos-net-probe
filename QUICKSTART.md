@@ -64,6 +64,19 @@ systemctl restart probe         # 重启（改配置/换探针域名后）
 journalctl -u probe -f          # 实时日志
 ```
 
+### L1 DNS 解析调优（v2.1/v2.2，可选环境变量）
+
+L1 解析为纯 socket 实现，支持重试/AAAA/超时调优；解析失败时看板显示具体原因（NXDOMAIN/SERVFAIL/REFUSED/无响应）与 DNS 耗时。可在 `probe.service` 的 `Environment=` 或启动前导出：
+
+```bash
+PROBE_DNS=auto                # DNS 服务器：auto=取 eth2/eth3 网卡IP→127.0.0.1 择优；或固定 10.60.2.254（等价 dig @10.60.2.254）
+PROBE_DNS_IFACES=eth2,eth3    # auto 模式取 IP 的网卡顺序
+PROBE_DNS_TIMEOUT=3    # 单次 DNS 查询超时(秒)
+PROBE_DNS_RETRIES=2    # UDP 丢包重试次数
+PROBE_DNS_AAAA=1       # A 无结果时补查 AAAA(0=关闭)
+# 改后：sudo systemctl restart probe
+```
+
 > **nginx 由 probe 服务托管**：`systemctl enable probe` 后，每次开机 probe 会自动拉起 nginx 并补站点软链（`ExecStartPre=ensure_nginx.sh`），运行时守护线程每 5 分钟自愈软链——不依赖 VyOS 是否启用 `service https`。已运行的 nginx 只 reload 不抢管理权。
 
 ### API 一览

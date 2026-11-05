@@ -431,6 +431,10 @@ function exitStop(){ clearInterval(exitTimer); clearInterval(exitCountTimer); $(
 function render(d){
   $('#ts').textContent='检测时间：'+d.ts;
   $('#dns').textContent=d.dns;
+  // v2.2：悬停显示 DNS 择优过程（各候选 IP/来源/是否应答/耗时）
+  if(d.dns_select && d.dns_select.tried){
+    $('#dns').title = d.dns_select.tried.map(t=>`${t.server} (${t.source}) ${t.ok?'✔':'✘'} ${t.rtt_ms}ms`).join('\n');
+  }
   // 动态分组渲染(自适应两出口/三出口):按role分组,顺序、标签、颜色全部数据驱动
   const ROLE_META = {
     us:       {label:'美国出口（USPROXY · oversea.yaml）', color:'var(--cyan)'},

@@ -5,6 +5,7 @@
 ## 快速开始
 
 **部署(VyOS 网关,root):**
+
 ```bash
 sudo bash /tmp/vyos-net-probe/deploy.sh   # 装探针服务(probe) + nginx站点(listen 8080)
 sudo systemctl restart probe
@@ -13,6 +14,7 @@ curl -s http://127.0.0.1:8899/healthz     # 验证 → ok
 ```
 
 **git 提交(开发机 Git Bash/WSL):**
+
 ```bash
 cd vyos-net-probe   # 进入项目目录
 git init && git config core.hooksPath .githooks   # 首次:初始化并启用钩子
@@ -28,7 +30,7 @@ git commit -m "feat: 出口分流监控探针"             # pre-commit 校验 +
 
 ```
 浏览器 ──HTTP:80──> nginx(VyOS, 独立站点 /) ──proxy_pass──> probe_server.py (127.0.0.1:8899)
-                                                          ├ dig @127.0.0.1  (L1 解析)
+                                                          ├ socket 问本地 DNS  (L1 解析，结构化 rcode/rtt，零 dig 依赖)
                                                           ├ curl 出口探测    (L2 出口IP)
                                                           ├ 归属地查询       (L4 附加，三源冗余；海外探针 ipinfo.io 优先，国内探针 ip-api.com 优先)
                                                           └ 分流对比         (L3 校验)
@@ -85,6 +87,7 @@ sudo bash /tmp/vyos-net-probe/deploy.sh
 | **历史趋势** | 每次探测落盘 `history.jsonl`（**按时间保留最近 7 天**，自动滚动清理），`/api/history` + 前端纯 SVG 折线图展示海外/国内出口延迟与整体状态时间线 |
 
 ### PPTP/GRE 判定逻辑
+
 - `gre_replied > 0` → 隧道双向已建立（✔ 正常）
 - 仅 `UNREPLIED` → 出向有、回包无（✘ 未打通，对应 route-exclude-address 未生效）
 - 无 GRE 条目 → 当前无客户端拨入（ⓘ 中性）
@@ -100,10 +103,57 @@ sudo bash /tmp/vyos-net-probe/deploy.sh
 历史文件 `history.jsonl`（出口探测）与 `pptp_history.jsonl`（PPTP/GRE 状态）均写在安装目录 `/opt/vyos-net-probe/`，systemd 的 `ReadWritePaths` 已放行。
 
 ### 历史保留策略（按时间滚动，防止文件无限增长）
+
 - **保留窗口**：最近 **7 天**（`HISTORY_RETENTION_DAYS = 7`），超期记录每次写入时自动清理。
 - **裁剪机制**：利用时间戳字典序快速定位 7 天分界；仅当行数超过「每天预期条数 × 7 × 1.1」硬上限时才真正解析裁剪，平时快速跳过——PPTP 每 10s 写入也无性能负担。
 - **硬上限兜底**：即使时钟异常/回拨，也按硬上限强制截断，文件 size 恒定可控。
 - 每天预期条数：出口 `HISTORY_PER_DAY=1440`（60s/次）、PPTP `PPTP_PER_DAY=8640`（10s/次）。7 天上限约 1.1 万 / 6.6 万行。
+
+## v2.1 新增能力（L1 解析加固 + 调度并发修复）
+
+本版聚焦把 L1 DNS 解析从“单发 UDP + 只看有无 A 记录”升级为工业级结构化解析，并修复探针调度的并发隐患。`dns_query_a()` 保留为向后兼容包装，现有看板字段（`resolved` / `levels.L1`）不变。
+
+| 加固点 | 说明 |
+|------|------|
+| **RCODE 判别** | 解析失败显性化为 `NXDOMAIN`（域名不存在）/ `SERVFAIL`（DNS 服务故障）/ `REFUSED`（被拒）/ `no_response`（超时不可达），不再是笼统红叉 |
+| **TID + 来源校验** | 校验响应的 Transaction ID 与来源 IP，杂包/伪造包不再被误接 |
+| **丢包重试** | UDP 丢包不再直接判失败，默认重试 2 次 |
+| **TC 截断回退 TCP** | 响应 TC=1 时自动改用 TCP/53 重查 |
+| **补查 AAAA** | A 无结果时查 IPv6，兼容纯 IPv6 解析 |
+| **解析耗时** | 新增 `dns_rtt`（ms），DNS 变慢可作早期告警 |
+| **调度并发修复** | `run_probes` 改为 `try/finally` + `shutdown(wait=False)` + `as_completed(timeout=PROBE_HARD_TIMEOUT)`，单探针卡死不再阻塞整体返回 |
+
+**探针结果新增字段（均为附加，不破坏兼容）：** `dns_rcode`、`dns_rtt`、`dns_error`。看板 L1 行已用上：失败显示中文化原因，成败均显示解析耗时。
+
+**新增环境变量（均可选，有默认值）：**
+
+| 环境变量 | 默认 | 说明 |
+|------|------|------|
+| `PROBE_DNS_TIMEOUT` | `3` | 单次 DNS 查询超时（秒） |
+| `PROBE_DNS_RETRIES` | `2` | UDP 丢包重试次数 |
+| `PROBE_DNS_AAAA` | `1` | A 无结果时是否补查 AAAA（0 关闭） |
+
+> L1 解析失败的典型场景：本地代理 DNS（53）未启动/不可达（`no_response`）、域名不存在（`NXDOMAIN`）、上游解析器故障（`SERVFAIL`）、或整探针超过硬上限（`PROBE_HARD_TIMEOUT`，默认 25s）。
+
+## v2.2 L1 DNS 服务器可指定（等价 `dig <域名> @<IP>`）
+
+**问题**：mihomo 等本地代理 DNS 若只监听内网网卡 IP（如 eth2 的 `10.60.2.254`），而不监听 `127.0.0.1`，旧版固定问 `127.0.0.1` 会导致 L1 全部显示「✘ 无响应/超时 (≈12000ms)」——而 `dig ifconfig.me @10.60.2.254` 却正常。
+
+**改进**：
+
+- `PROBE_DNS` 默认改为 `auto`：依次取 `PROBE_DNS_IFACES`（默认 `eth2,eth3`）网卡的 IPv4，最后回退 `127.0.0.1`；每轮先对候选做一次快速探活（≤1.5s/个），选第一个有应答的服务器供全部探针共用（成功结果缓存 `PROBE_DNS_SELECT_TTL` 秒）。
+- 也可固定指定：`PROBE_DNS=10.60.2.254`（等价 `dig @10.60.2.254`）、多个 `PROBE_DNS=10.60.2.254,10.60.3.254`、或直接写网卡名 `PROBE_DNS=eth2`。
+- 网卡 IP 读取：优先 ioctl `SIOCGIFADDR`（零依赖），失败回退 `ip -4 -o addr show dev <网卡>`。
+- A 记录完全无应答时不再补查 AAAA（服务器不通时补查无意义），失败耗时减半。
+- 结果新增 `dns_server`（每个探针实际使用的 DNS）、`dns_select`（择优过程）；看板顶部「DNS：」显示选中服务器，悬停可看各候选是否应答及耗时；`/api/mode` 同步返回。
+
+| 环境变量 | 默认 | 说明 |
+|------|------|------|
+| `PROBE_DNS` | `auto` | `auto` / IP（可逗号分隔多个）/ 网卡名 |
+| `PROBE_DNS_IFACES` | `eth2,eth3` | `auto` 模式下取 IP 的网卡顺序 |
+| `PROBE_DNS_SELECT_TTL` | `60` | 择优结果缓存秒数 |
+
+> ⚠️ 升级需重新执行 `deploy.sh`（会覆盖 `/etc/systemd/system/probe.service` 并 daemon-reload），旧 service 中的 `PROBE_DNS=127.0.0.1` 会覆盖代码默认值。
 
 ## 自定义探针
 
@@ -151,4 +201,4 @@ VyOS 靠 `config.boot` + `service_https.py` 驱动 nginx，不用 `systemctl ena
 
 - `probe_server.py` 只监听 `127.0.0.1:8899`，不直接对外，必须经 nginx 反代访问（根路径 `/`）。
 - 独立站点默认只允许内网网段访问，按需调整 `allow/deny`。
-- 若 VyOS 无 `dig`，探针的 L1 解析会显示失败，但 L2 出口探测（curl）仍正常；可自行改用纯 curl 验证。
+- L1 解析为纯 Python `socket` 实现（零 `dig` 依赖）；解析失败时看板会显示具体原因（NXDOMAIN/SERVFAIL/REFUSED/无响应）与 DNS 耗时，便于区分“本地代理 DNS 不通”还是“域名解析不出”。

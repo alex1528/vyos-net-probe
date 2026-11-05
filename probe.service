@@ -13,7 +13,12 @@ ExecStartPre=+/bin/bash /opt/vyos-net-probe/ensure_nginx.sh
 ExecStart=/usr/bin/python3 /opt/vyos-net-probe/probe_server.py
 Environment=PROBE_HOST=127.0.0.1
 Environment=PROBE_PORT=8899
-Environment=PROBE_DNS=127.0.0.1
+# L1 DNS 服务器（等价 dig <域名> @<IP>）：
+#   auto = 依次取 PROBE_DNS_IFACES 网卡 IPv4（eth2→eth3），最后回退 127.0.0.1，探活择优
+#   也可固定：PROBE_DNS=10.60.2.254  或多个：PROBE_DNS=10.60.2.254,10.60.3.254  或网卡名：PROBE_DNS=eth2
+#   注：mihomo DNS 若只监听内网网卡 IP（非 127.0.0.1），旧值 127.0.0.1 会导致 L1 全部"无响应/超时"
+Environment=PROBE_DNS=auto
+Environment=PROBE_DNS_IFACES=eth2,eth3
 # 软链自愈检查间隔(秒)，0=关闭；防 VyOS commit/升级覆盖后本站点软链失效
 Environment=PROBE_SELF_HEAL_INTERVAL=300
 # mihomo 配置文件路径（探针启动时自动检测出口模式：有HKPROXY→三出口/仅USPROXY→两出口）
