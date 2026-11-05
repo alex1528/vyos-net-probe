@@ -104,6 +104,19 @@
 | 8.6 | 固定 IP 写法 | `PROBE_DNS=10.60.2.254` 重启 | 行为同上，`dns_select.source=static` | ☐ |
 | 8.7 | 不通时耗时减半 | `PROBE_DNS=192.0.2.1` 前台跑一次 | `no_response`，`dns_rtt` ≈ 6000ms（旧版 ≈12000ms） | ☐ |
 
+## 9. v2.3 出口通道判定 + 归属地预期
+
+| # | 项 | 命令 / 操作 | 预期 | 结果 |
+|---|------|------------|------|------|
+| 9.1 | 卡片标签 | 浏览器 `:8080/` | 卡片右上显示 `DIRECT 通道` / `HKPROXY 通道` / `USPROXY 通道` | ☐ |
+| 9.2 | 区分 A/B | 对比国内探针与香港探针的 L2 出口 IP | 不同 = A（线路在香港）；相同 = B（串线） | ☐ |
+| 9.3 | A 默认提示 | 未设 `PROBE_GEO_DIRECT` | 国内卡片 L4 显示黄色 `ⓘ 线路所在地·预期 CN`，判定 `通过` | ☐ |
+| 9.4 | A 设 HK | `PROBE_GEO_DIRECT=HK` 后 `systemctl daemon-reload && systemctl restart probe` | L4 显示 `中国香港 (HK) ✔`，无提示 | ☐ |
+| 9.5 | B 串线 | 临时删掉 `DOMAIN-SUFFIX,cip.cc,DIRECT` 并重载 mihomo | cip.cc 卡片 L2 `✘ 串线：与 HKPROXY 相同`、判失败；L3 报分流异常；测完恢复规则 | ☐ |
+| 9.6 | 严格模式 | `PROBE_GEO_STRICT=1` 重启 | 归属地不一致显示红色 `⚠不符（预期 CN）` 并判失败 | ☐ |
+| 9.7 | 接口字段 | `curl -s http://127.0.0.1:8899/api/probe \| python3 -m json.tool \| grep -E 'channel\|geo_expect\|geo_status\|crosstalk'` | 每个探针均有这些字段 | ☐ |
+| 9.8 | 模式接口 | `curl -s http://127.0.0.1:8899/api/mode \| python3 -m json.tool` | 含 `channels`、`geo_expect`、`geo_strict` | ☐ |
+
 ## 回滚方法（如需）
 
 - 代码回滚：`git checkout <上一个提交> -- probe_server.py index.html` 后 `systemctl restart probe`。

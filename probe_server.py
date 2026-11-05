@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 =====================================================================
- 出口分流探针后端服务  (probe_server.py)  v2.2
+ 出口分流探针后端服务  (probe_server.py)  v2.3
 =====================================================================
  功能：
    - L1 DNS 解析：纯 socket 构造 DNS 查询包问本地代理 DNS（零 dig 依赖，等价 dig @IP；
      默认自动取 eth2/eth3 网卡 IP 作为 DNS 服务器，可用 PROBE_DNS 指定）
    - L2 出口探测：curl 取出口 IP + 测量延迟
-   - L4 归属地：多源冗余查询（附加信息，不影响核心判定）
+   - L4 归属地：多源冗余查询；按出口通道(DIRECT/HKPROXY/USPROXY)配置预期归属地，
+     不一致默认仅提示（PROBE_GEO_STRICT=1 可改为判失败）
+   - 串线检测：某通道出口 IP 与其他通道相同 → 判失败（规则没命中、掉进兜底等）
    - L3 分流校验：海外出口 IP ≠ 国内出口 IP
    - PPTP/GRE：读 /proc/net/nf_conntrack 判断隧道状态（零 conntrack 依赖）
    - 历史趋势：每次探测落盘 history.jsonl，供曲线展示
@@ -118,6 +120,45 @@ def _detect_exit_mode():
         return 3
 EXIT_MODE = _detect_exit_mode()
 PROBES = PROBES_3EXIT if EXIT_MODE == 3 else PROBES_2EXIT
+
+# ---------------------------------------------------------------------
+# v2.3 出口通道 + 归属地预期
+#   判定“是否走对出口”以通道为准：出口 IP 与其他通道相同 = 串线(失败)；
+#   归属地只回答“这条线路在哪”，按通道配置预期，默认不一致仅提示。
+#   PROBE_GEO_DIRECT / PROBE_GEO_HKPROXY / PROBE_GEO_USPROXY 取值：
+#     CN | HK | CN,HK(任一) | !CN(非CN) | any(不检查)；未设置时沿用 PROBES 中的 want
+#   PROBE_GEO_STRICT=1 → 归属地不一致也判失败（默认 0，仅提示）
+# ---------------------------------------------------------------------
+ROLE_CHANNEL = {"us": "USPROXY", "hk": "HKPROXY", "oversea": "USPROXY", "domestic": "DIRECT"}
+GEO_STRICT = os.environ.get("PROBE_GEO_STRICT", "0") not in ("0", "false", "False", "")
+
+def channel_of(role):
+    return ROLE_CHANNEL.get(role, str(role).upper())
+
+def _geo_spec(channel, want):
+    """返回该通道的归属地预期原始串：环境变量优先，否则用探针 want。"""
+    raw = os.environ.get(f"PROBE_GEO_{channel}", "").strip()
+    return raw or (want or "any")
+
+def geo_expect_label(spec):
+    s = (spec or "any").strip()
+    if s.lower() == "any":
+        return "不限"
+    if s.startswith("!"):
+        return "非" + "/".join(x.strip().upper() for x in s[1:].split(",") if x.strip())
+    return "/".join(x.strip().upper() for x in s.split(",") if x.strip())
+
+def geo_match(cc, spec):
+    """cc 是否符合预期。spec 为 any 时恒 True；cc 为空返回 None(无法判断)。"""
+    s = (spec or "any").strip()
+    if s.lower() == "any":
+        return True
+    if not cc:
+        return None
+    neg = s.startswith("!")
+    codes = {x.strip().upper() for x in (s[1:] if neg else s).split(",") if x.strip()}
+    hit = cc.upper() in codes
+    return (not hit) if neg else hit
 # PPTP VPN 服务器 IP（用于在 conntrack 中过滤 GRE 条目）
 VPN_IPS = ["61.160.251.125", "36.154.11.187"]
 
@@ -620,7 +661,11 @@ def pptp_status():
 def _probe_one(pcfg, dns_server=None):
     """单个探针的完整检测(L1解析 + L2出口 + L4归属地)。供并行调用。"""
     domain, expect, want, role = pcfg["domain"], pcfg["expect"], pcfg["want"], pcfg["role"]
-    item = {"domain": domain, "expect": expect, "role": role,
+    channel = channel_of(role)
+    gspec = _geo_spec(channel, want)
+    item = {"domain": domain, "expect": expect, "role": role, "channel": channel,
+            "geo_expect": geo_expect_label(gspec), "geo_status": None,
+            "geo_strict": GEO_STRICT, "crosstalk": None,
             "resolved": None, "dns_server": None, "dns_rcode": None, "dns_rtt": None, "dns_error": None,
             "exit_ip": None, "latency": None,
             "cc": None, "country": None, "geo_ok": None, "ok": True,
@@ -644,16 +689,18 @@ def _probe_one(pcfg, dns_server=None):
     item["levels"]["L2"] = bool(exit_ip)
     if not exit_ip:
         item["ok"] = False
-    # L4: 归属地(附加)
+    # L4: 归属地——回答“这条线路在哪”，与通道预期比对；默认不一致仅提示
     if exit_ip:
-        cc, country = geo_lookup(exit_ip, prefer_oversea=(role == "oversea"))
+        # 代理通道(非 DIRECT)优先 ipinfo.io，对海外 IP 判定更准（v2.3 修正：原仅 oversea 角色生效）
+        cc, country = geo_lookup(exit_ip, prefer_oversea=(channel != "DIRECT"))
         item["cc"], item["country"] = cc, country
-        if cc:
-            if (want == "CN" and cc != "CN") or (want == "!CN" and cc == "CN"):
-                item["geo_ok"] = False
+        m = geo_match(cc, gspec)
+        if m is True:
+            item["geo_ok"], item["geo_status"] = True, "match"
+        elif m is False:
+            item["geo_ok"], item["geo_status"] = False, "mismatch"
+            if GEO_STRICT:
                 item["ok"] = False
-            else:
-                item["geo_ok"] = True
     return item
 
 def run_probes():
@@ -669,7 +716,10 @@ def run_probes():
 
     def _timeout_item(pcfg):
         # 探针整体超时时的兜底结果(视为该探针失败)
+        ch = channel_of(pcfg["role"])
         return {"domain": pcfg["domain"], "expect": pcfg["expect"], "role": pcfg["role"],
+                "channel": ch, "geo_expect": geo_expect_label(_geo_spec(ch, pcfg.get("want"))),
+                "geo_status": None, "geo_strict": GEO_STRICT, "crosstalk": None,
                 "resolved": None, "dns_server": dsel["server"], "dns_rcode": None, "dns_rtt": None, "dns_error": "timeout",
                 "exit_ip": None, "latency": None,
                 "cc": None, "country": None, "geo_ok": None, "ok": False,
@@ -696,6 +746,21 @@ def run_probes():
                 results[idx] = _timeout_item(PROBES[idx])
     finally:
         ex.shutdown(wait=False)   # 不等卡死线程，避免被退出处阻塞整体返回
+    # v2.3 串线检测：出口 IP 与“其他通道”任一探针相同 → 该探针判失败
+    #   仅凭 IP 无法断定哪一方走错，故相同的两侧都会标出（L3 同时报分流异常）
+    ips_by_ch = {}
+    for it in results:
+        if it.get("exit_ip"):
+            ips_by_ch.setdefault(it.get("channel") or channel_of(it["role"]), set()).add(it["exit_ip"])
+    for it in results:
+        ip = it.get("exit_ip")
+        if not ip:
+            continue
+        mine = it.get("channel") or channel_of(it["role"])
+        others = sorted(ch for ch, s in ips_by_ch.items() if ch != mine and ip in s)
+        if others:
+            it["crosstalk"] = others
+            it["ok"] = False
     # 汇总(保持 PROBES 原始顺序，ex.map 有序返回)
     for item in results:
         if item["exit_ip"]:
@@ -711,11 +776,11 @@ def run_probes():
         unique_ips = set(exit_ips.values())
         if len(unique_ips) == len(exit_ips):
             split["ok"] = True
-            labels = " / ".join(f"{r}={ip}" for r, ip in exit_ips.items())
+            labels = " / ".join(f"{channel_of(r)}={ip}" for r, ip in exit_ips.items())
             split["msg"] = f"分流生效：{len(exit_ips)} 个出口IP互不相同（{labels}）"
         else:
             split["ok"] = False
-            labels = " / ".join(f"{r}={ip}" for r, ip in exit_ips.items())
+            labels = " / ".join(f"{channel_of(r)}={ip}" for r, ip in exit_ips.items())
             split["msg"] = f"分流异常：存在相同出口IP（{labels}），检查规则/oversea.yaml"
             failed += 1
     else:
@@ -798,7 +863,7 @@ def read_pptp_history(n=60):
 # HTTP 服务
 # =====================================================================
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ExitProbe/2.2"
+    server_version = "ExitProbe/2.3"
 
     def log_message(self, fmt, *args):
         pass
@@ -853,6 +918,9 @@ class Handler(BaseHTTPRequestHandler):
                 "dns_config": PROBE_DNS_RAW,
                 "dns_ifaces": DNS_IFACES,
                 "dns_select": select_dns_server(),
+                "channels": {r: channel_of(r) for r in sorted(set(p["role"] for p in PROBES))},
+                "geo_expect": {channel_of(p["role"]): geo_expect_label(_geo_spec(channel_of(p["role"]), p.get("want"))) for p in PROBES},
+                "geo_strict": GEO_STRICT,
                 "roles": sorted(set(p["role"] for p in PROBES)),
                 "probes": PROBES,
             }
@@ -892,7 +960,7 @@ def _selfheal_symlink_loop():
 
 def main():
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    print(f"[probe_server v2.2] http://{LISTEN_HOST}:{LISTEN_PORT}  PROBE_DNS={PROBE_DNS_RAW} IFACES={','.join(DNS_IFACES)}")
+    print(f"[probe_server v2.3] http://{LISTEN_HOST}:{LISTEN_PORT}  PROBE_DNS={PROBE_DNS_RAW} IFACES={','.join(DNS_IFACES)}")
     try:
         sel = select_dns_server(force=True)
         print(f"[probe_server] L1 DNS 选中 {sel['server']}({sel['source']}) ok={sel['ok']}  候选={[t['server'] for t in sel['tried']]}")

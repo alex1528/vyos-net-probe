@@ -19,6 +19,12 @@ Environment=PROBE_PORT=8899
 #   注：mihomo DNS 若只监听内网网卡 IP（非 127.0.0.1），旧值 127.0.0.1 会导致 L1 全部"无响应/超时"
 Environment=PROBE_DNS=auto
 Environment=PROBE_DNS_IFACES=eth2,eth3
+# L4 归属地预期（v2.3，按出口通道）：CN | HK | CN,HK | !CN | any；未设置则 DIRECT=CN、代理=!CN
+#   归属地只表示“线路在哪”，不一致默认仅提示；是否走错出口由“串线检测”(出口IP相同)判定
+#   若 DIRECT 线路本身在香港，取消下一行注释即可消除提示
+#Environment=PROBE_GEO_DIRECT=HK
+# 归属地不一致也判失败（默认 0=仅提示）
+Environment=PROBE_GEO_STRICT=0
 # 软链自愈检查间隔(秒)，0=关闭；防 VyOS commit/升级覆盖后本站点软链失效
 Environment=PROBE_SELF_HEAL_INTERVAL=300
 # mihomo 配置文件路径（探针启动时自动检测出口模式：有HKPROXY→三出口/仅USPROXY→两出口）

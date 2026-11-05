@@ -155,6 +155,33 @@ sudo bash /tmp/vyos-net-probe/deploy.sh
 
 > ⚠️ 升级需重新执行 `deploy.sh`（会覆盖 `/etc/systemd/system/probe.service` 并 daemon-reload），旧 service 中的 `PROBE_DNS=127.0.0.1` 会覆盖代码默认值。
 
+## v2.3 出口通道判定 + 归属地预期可配置
+
+**问题**：国内探针显示「L4 归属地 香港 (HK) ⚠不符」时，可能是两种完全不同的情况，旧版无法区分：
+
+| 情况 | 原因 | 性质 |
+|------|------|------|
+| A. DIRECT 线路本身在香港 | WAN 口 IP 被归属地库判为 HK | 正常，只是“国内=CN”的预期不适合该环境 |
+| B. 流量串到代理 | 没命中 DIRECT 规则，掉进 `MATCH,HKPROXY` | 真故障 |
+
+**改进**：是否走对出口以「通道」判定，归属地只回答“线路在哪”。
+
+- 卡片标签改为通道名：`DIRECT 通道` / `HKPROXY 通道` / `USPROXY 通道`；分组标题、L3 文案同步。
+- **串线检测**：某探针出口 IP 与其他通道任一探针相同 → 判失败，L2 行显示 `✘ 串线：与 HKPROXY 相同`（仅凭 IP 无法断定哪方走错，相同的两侧都会标出，L3 同时报分流异常）。
+- **归属地预期按通道配置**：`PROBE_GEO_DIRECT` / `PROBE_GEO_HKPROXY` / `PROBE_GEO_USPROXY`，取值 `CN`、`HK`、`CN,HK`（任一）、`!CN`（非 CN）、`any`（不检查）；未设置时沿用探针 `want`（DIRECT=CN，代理=!CN）。
+- **不一致默认仅提示**：L4 行显示黄色 `ⓘ 线路所在地·预期 CN`，不计入失败；`PROBE_GEO_STRICT=1` 恢复为红色 `⚠不符` 并判失败。
+- 修正：代理通道（含三出口模式的 us/hk）归属地查询优先 ipinfo.io（原仅 `oversea` 角色生效）。
+- 结果新增字段：`channel`、`geo_expect`、`geo_status`(match/mismatch)、`geo_strict`、`crosstalk`；`/api/mode` 返回 `channels`、`geo_expect`、`geo_strict`。
+
+| 环境变量 | 默认 | 说明 |
+|------|------|------|
+| `PROBE_GEO_DIRECT` | （沿用 want=CN） | DIRECT 通道预期归属地；DIRECT 线路在香港时设为 `HK` |
+| `PROBE_GEO_HKPROXY` | （沿用 want=!CN） | HKPROXY 通道预期归属地 |
+| `PROBE_GEO_USPROXY` | （沿用 want=!CN） | USPROXY 通道预期归属地 |
+| `PROBE_GEO_STRICT` | `0` | `1` = 归属地不一致也判失败 |
+
+> 判断是 A 还是 B：看国内探针与香港探针的 L2 出口 IP——不同为 A，相同为 B（v2.3 会直接显示串线）。
+
 ## 自定义探针
 
 编辑 `probe_server.py` 顶部 `PROBES` 列表增减探测域名：

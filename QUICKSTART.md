@@ -77,7 +77,16 @@ PROBE_DNS_AAAA=1       # A 无结果时补查 AAAA(0=关闭)
 # 改后：sudo systemctl restart probe
 ```
 
-> **nginx 由 probe 服务托管**：`systemctl enable probe` 后，每次开机 probe 会自动拉起 nginx 并补站点软链（`ExecStartPre=ensure_nginx.sh`），运行时守护线程每 5 分钟自愈软链——不依赖 VyOS 是否启用 `service https`。已运行的 nginx 只 reload 不抢管理权。
+### L4 归属地预期（v2.3，按出口通道）
+
+归属地只表示“线路在哪”，与预期不一致默认黄色提示、不判失败；是否走错出口由串线检测（出口 IP 与其他通道相同）判定。
+
+```bash
+PROBE_GEO_DIRECT=HK    # DIRECT 线路本身在香港时设置（可写 CN,HK / !CN / any）
+PROBE_GEO_STRICT=0     # 1 = 归属地不一致也判失败
+```
+
+> **nginx 由 probe 服务托管**
 
 ### API 一览
 
